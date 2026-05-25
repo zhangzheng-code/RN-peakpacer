@@ -1,0 +1,139 @@
+严格执行：给 Claude 的 Step-by-Step 开发指令
+请将以下指令依次复制发送给 Claude。完成一个步骤并验证成功后，再向我申请获取下一个步骤的开发指令。
+
+指令 1：【第 1-3 天】项目初始化、TailwindCSS 配置与高德在线瓦片地图渲染
+发送给 Claude 的 Prompt：
+
+你是一位精通 React Native、Expo 跨平台开发和 GIS 地图渲染的高级架构师。现在我们需要开发一款名为 "SmartHike" 的智慧户外徒步应用的核心模块。
+
+任务目标：
+在不集成任何高德/百度原生 SDK（因为这在 Expo 托管流中配置极度繁琐）的前提下，利用 Expo SDK 52+ 和 react-native-maps，通过 UrlTile 加载高德地图的在线瓦片源。同时配置好 Tailwind CSS 样式。
+
+请严格按照以下步骤生成 100% 完整、无省略的代码：
+
+指导我如何使用 Expo CLI 初始化一个 TypeScript 项目，并安装必要的依赖项：
+
+@react-native-async-storage/async-storage
+
+zustand
+
+react-native-maps
+
+expo-location
+
+nativewind 和 tailwindcss (请给出符合最新 v4 版本的配置步骤和 app.json 的 plugins 配置)
+
+给出 tailwind.config.js 和 global.css 的完整配置。
+
+创建一个地图容器组件 src/components/MapContainer.tsx：
+
+使用 react-native-maps 的 MapView 作为底层组件。
+
+使用  渲染高德的标准路网瓦片（UrlTemplate: https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}）和高德卫星图。
+
+实现一个极简的“图源切换按钮”，允许用户在“标准等高线路网”与“卫星影像图”之间无缝切换。
+
+支持显示用户的当前定位蓝点。
+
+请提供完整的 TypeScript 代码，要求：
+
+结构清晰，类型定义严格。
+
+关键逻辑（如瓦片地址格式、MapView 参数控制）有详尽的中文注释。
+
+代码必须是完整的，不要使用 "//... 保持不变" 等缩略写法。
+
+指令 2：【第 4-7 天】高精度后台轨迹定位与 Kalman+RDP 双重平滑纠偏算法
+发送给 Claude 的 Prompt：
+
+你是一位精通移动端传感器数据处理与计算几何的算法专家。我们需要在 React Native 应用中实现一个“高精度、高帧率、低功耗”的徒步轨迹记录系统。
+
+任务目标：
+利用 expo-location 和 expo-task-manager 实现后台持续定位打点，并使用 JS/TS 纯手工编写“卡尔曼滤波”平滑噪点和“RDP 抽稀算法”压缩轨迹，保障 Polyline 在地图层渲染时达到流畅的 60fps。
+
+请严格按照以下要求生成代码，不要包含任何省略号：
+
+在 src/utils/gpsFilter.ts 中手写：
+
+一个基于状态估计的 KalmanFilter 类，用于实时过滤单点定位的跳点和漂移。
+
+一个标准的 Ramer-Douglas-Peucker (RDP) 算法函数，接收经纬度数组与 epsilon 参数，对冗余轨迹点进行抽稀。
+
+包含详尽的代码注释，解释卡尔曼增益 K 与测量误差 R 的调节逻辑。
+
+编写 Expo 后台任务注册逻辑：
+
+使用 TaskManager.defineTask 定义后台位置更新任务。
+
+任务触发时，新获取的坐标点必须先流过卡尔曼滤波器进行纠偏，再追加进轨迹数组中。
+
+配置好 iOS (UIBackgroundModes location) 和 Android (ACCESS_BACKGROUND_LOCATION) 的权限引导说明。
+
+在地图组件上渲染 Polyline：
+
+接入纠偏压缩后的轨迹，实时呈现在 react-native-maps 上。
+
+提供“开始徒步”和“停止记录”的控制手势与 UI 按钮。
+
+请输出 100% 完整的 TypeScript 代码文件，不允许有任何占位符。
+
+指令 3：【第 8-10 天】Zustand 离线状态持久化与生理耗竭指数（PEI）安全监测系统
+发送给 Claude 的 Prompt：
+
+你是一位精通 Local-First（本地优先）架构与物联网生理指标评估的专家。我们需要在 SmartHike App 中实现离线状态存储和端侧安全守护功能。
+
+任务目标：
+
+使用 Zustand + AsyncStorage 建立全局状态机。即使 App 进程在后台被系统强杀，重新打开时依然能恢复用户的当前徒步轨迹、累积海拔与体征状态。
+
+在端侧实现“生理耗竭指数 (PEI)”数学评估模型。使用 UI 滑块模拟智能手环输入用户的静息心率、当前运动心率和血氧饱和度，实时计算 PEI 指数。
+
+一旦 PEI 超出安全阈值，立即调用 expo-notifications 触发本地报警通知，并触发系统级的触觉振动反馈（expo-haptics），在界面上强制弹出脱水与高反应急防护卡片，同时呈现关联运动补给品推荐。
+
+请严格按照以下格式生成 100% 完整代码：
+
+详细写出 PEI 的数学计算公式实现：
+PEI = w1 * ((HR_current - HR_resting) / (HR_max - HR_resting)) + w2 * (100 - SpO2) + w3 * (DeltaH / 100) * ln(1 + slope)
+其中权重分别设为 0.50, 0.35, 0.15。
+
+完整编写 src/store/useHikeStore.ts 持久化状态配置文件。
+
+完整编写生理体征面板 src/components/BiometricsPanel.tsx，使用 NativeWind 美化 UI。
+
+不要使用任何省略号，所有 TS interface、状态更新 action 必须完整呈现。
+
+指令 4：【第 11-13 天】DeepSeek-V4 智能领队 RAG 提示词工程与 SSE 流式渲染
+发送给 Claude 的 Prompt：
+
+你是一位精通生成式 AI（Generative AI）和 Prompt 工程的高级架构师。我们需要为 SmartHike 打造一个能够在弱网环境下为用户提供精细化、千人千面安全防护建议的 AI 领队。
+
+任务目标：
+
+集成 DeepSeek-V4 官方 API。由于其完全兼容 OpenAI 协议，请使用 axios 或 fetch 实现流式传输（Server-Sent Events），使文本能像打字机一样逐字渲染在 React Native 界面上。
+
+编写极其严苛的端侧 RAG 提示词模板。在用户发起提问时，自动从 Zustand 状态机中提取：当前心率、血氧饱和度、已攀登海拔高度、当前所处位置和天气状况。将这些数据作为不可篡改的【环境物理上下文】注入 System Prompt。
+
+严格限制 AI 的幻觉行为。例如：当血氧饱和度 SpO2 低于 90% 且心率过高时，AI 必须在回答最头部显著加粗输出【红色生命警报】，勒令用户就地休息。
+
+请提供：
+
+src/services/deepseekService.ts 完整对接文件（包括流式 SSE 处理，处理 React Native 环境下的 TextDecoder 兼容问题，或提供轻量级 SSE 字符解析函数）。
+
+src/screens/AIChatScreen.tsx 聊天交互界面的完整代码，采用 react-native-gifted-chat 或手写 FlatList 实现优雅的流式消息框气泡渲染。
+
+请输出 100% 可直接运行的完整 TypeScript 文件。
+
+指令 5：【第 14-15 天】地图网格探索度点亮系统与性能调优
+发送给 Claude 的 Prompt：
+
+你是一位资深的移动端图形性能优化专家。现在进入 SmartHike 项目的收尾阶段，我们需要为应用增添游戏化的社交属性——“地图探索度点亮”功能，并进行最后的打包性能压测。
+
+任务目标：
+
+实现地图网格点亮：将全球地图坐标网格化（在端侧用简易的经纬度二维矩阵或 GeoJSON Polygon 模拟）。当用户轨迹的 GPS 坐标与网格相交时，该网格的透明度从 0.6 变为 0（点亮网格），并在地图上以亮色多边形图层渲染。
+
+解决重渲染（Re-render）性能瓶颈：MapView 频繁绘制 Polyline 会导致中低端设备严重卡顿。请利用 React.memo 对地图图层进行静态化（Static Memoization），优化 Zustand 的 shallow 浅比较订阅，确保拖拽地图时帧率稳定在 60fps。
+
+提供一份针对 App Store 和 Google Play 简历亮点的真机评测数据和排查话术模板。
+
+请给出完整的 TS 算法实现，并在地图组件中集成 GeoJSON 渲染逻辑，代码中不得包含任何省略或简写。
