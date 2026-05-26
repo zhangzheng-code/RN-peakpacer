@@ -21,7 +21,7 @@
 
 import * as TaskManager from 'expo-task-manager';
 import * as Location from 'expo-location';
-import type { LocationObject } from 'expo-location';
+import type { LocationObject, LocationSubscription } from 'expo-location';
 import { GpsKalmanFilter } from '../utils/gpsFilter';
 import type { TrailPoint } from '../types';
 
@@ -72,6 +72,12 @@ let totalDistance: number = 0;
 let lastPoint: TrailPoint | null = null;
 
 /**
+ * 前台持续定位订阅（Expo Go 回退方案）
+ * 当后台定位不可用时，使用 watchPositionAsync 在前台持续获取位置
+ */
+let foregroundWatch: LocationSubscription | null = null;
+
+/**
  * 获取当前轨迹缓冲区的副本
  * 前台组件调用此方法获取最新轨迹数据
  */
@@ -118,57 +124,22 @@ export function resetTrailBuffer(): void {
  *   5. 追加进轨迹缓冲区
  */
 TaskManager.defineTask<LocationTaskData>(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
-  // ---- 错误处理 ----
   if (error) {
     console.error('[BackgroundLocationTask] 后台定位任务出错:', error.message);
     return;
   }
 
-  // ---- 数据校验 ----
   if (!data || !data.locations || data.locations.length === 0) {
     return;
   }
 
-  // 取最新的定位点（locations 数组可能包含多个点）
   const latestLocation = data.locations[data.locations.length - 1];
 
   if (!latestLocation || !latestLocation.coords) {
     return;
   }
 
-  // ---- 构造原始轨迹点 ----
-  const rawPoint: TrailPoint = {
-    latitude: latestLocation.coords.latitude,
-    longitude: latestLocation.coords.longitude,
-    timestamp: latestLocation.timestamp || Date.now(),
-    altitude: latestLocation.coords.altitude,
-    accuracy: latestLocation.coords.accuracy,
-  };
-
-  // ---- 卡尔曼滤波纠偏 ----
-  // 将原始 GPS 点送入滤波器，消除跳点和漂移
-  const filteredPoint = kalmanFilter.filter(rawPoint);
-
-  // ---- 精度门控 ----
-  // 如果 GPS 精度过差（> 50m），丢弃该点避免轨迹严重偏移
-  if (filteredPoint.accuracy !== null && filteredPoint.accuracy !== undefined) {
-    if (filteredPoint.accuracy > 50) {
-      return;
-    }
-  }
-
-  // ---- 计算增量距离 ----
-  if (lastPoint !== null) {
-    const deltaDistance = haversineDistance(lastPoint, filteredPoint);
-    // 过滤异常跳变：单次位移超过 100m 认为是 GPS 漂移，不累加
-    if (deltaDistance < 100) {
-      totalDistance += deltaDistance;
-    }
-  }
-
-  // ---- 追加进轨迹缓冲区 ----
-  trailBuffer.push(filteredPoint);
-  lastPoint = filteredPoint;
+  processLocationPoint(latestLocation.coords, latestLocation.timestamp || Date.now());
 });
 
 /**
@@ -222,16 +193,44 @@ function haversineDistance(p1: TrailPoint, p2: TrailPoint): number {
  *   Android 要求后台定位必须运行在前台服务中，
  *   需要配置通知标题和内容，用户可在通知栏看到并管理
  */
+/**
+ * 处理单个定位点的通用逻辑（卡尔曼滤波 + 精度门控 + 距离累加 + 入缓冲区）
+ */
+function processLocationPoint(coords: { latitude: number; longitude: number; altitude: number | null; accuracy: number | null }, timestamp: number) {
+  const rawPoint: TrailPoint = {
+    latitude: coords.latitude,
+    longitude: coords.longitude,
+    timestamp,
+    altitude: coords.altitude,
+    accuracy: coords.accuracy,
+  };
+
+  const filteredPoint = kalmanFilter.filter(rawPoint);
+
+  if (filteredPoint.accuracy !== null && filteredPoint.accuracy !== undefined && filteredPoint.accuracy > 50) {
+    return;
+  }
+
+  if (lastPoint !== null) {
+    const deltaDistance = haversineDistance(lastPoint, filteredPoint);
+    if (deltaDistance < 100) {
+      totalDistance += deltaDistance;
+    }
+  }
+
+  trailBuffer.push(filteredPoint);
+  lastPoint = filteredPoint;
+}
+
 export async function startBackgroundLocation(): Promise<boolean> {
   try {
-    // 检查后台定位权限
+    // 优先尝试后台定位
     const { status: backgroundStatus } = await Location.getBackgroundPermissionsAsync();
     if (backgroundStatus !== 'granted') {
-      // 请求后台定位权限
       const { status: requestedStatus } = await Location.requestBackgroundPermissionsAsync();
       if (requestedStatus !== 'granted') {
-        console.warn('[BackgroundLocationTask] 后台定位权限未授予');
-        return false;
+        console.warn('[BackgroundLocationTask] 后台定位权限未授予，尝试前台定位回退');
+        return await startForegroundFallback();
       }
     }
 
@@ -255,15 +254,48 @@ export async function startBackgroundLocation(): Promise<boolean> {
       },
     });
 
+    console.log('[BackgroundLocationTask] 后台定位已启动');
     return true;
   } catch (error) {
-    console.error('[BackgroundLocationTask] 启动后台定位失败:', error);
+    console.warn('[BackgroundLocationTask] 后台定位不可用，切换到前台定位:', error);
+    return await startForegroundFallback();
+  }
+}
+
+/**
+ * 前台持续定位回退方案
+ * 适用于 Expo Go 等不支持后台定位的环境
+ * 使用 watchPositionAsync 在前台持续获取位置，写入同一个 trailBuffer
+ */
+async function startForegroundFallback(): Promise<boolean> {
+  try {
+    // 先清理可能存在的旧订阅
+    if (foregroundWatch) {
+      foregroundWatch.remove();
+      foregroundWatch = null;
+    }
+
+    foregroundWatch = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeInterval: 1000,
+        distanceInterval: 5,
+      },
+      (location) => {
+        processLocationPoint(location.coords, location.timestamp);
+      },
+    );
+
+    console.log('[BackgroundLocationTask] 前台定位已启动（Expo Go 兼容模式）');
+    return true;
+  } catch (error) {
+    console.error('[BackgroundLocationTask] 前台定位也启动失败:', error);
     return false;
   }
 }
 
 /**
- * 停止后台定位服务
+ * 停止定位服务（后台任务 + 前台回退）
  */
 export async function stopBackgroundLocation(): Promise<void> {
   try {
@@ -273,5 +305,11 @@ export async function stopBackgroundLocation(): Promise<void> {
     }
   } catch (error) {
     console.error('[BackgroundLocationTask] 停止后台定位失败:', error);
+  }
+
+  // 清理前台回退订阅
+  if (foregroundWatch) {
+    foregroundWatch.remove();
+    foregroundWatch = null;
   }
 }

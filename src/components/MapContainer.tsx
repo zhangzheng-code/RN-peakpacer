@@ -17,31 +17,18 @@ import {
   resetTrailBuffer,
   getTotalDistance,
 } from '../tasks/backgroundLocationTask';
+import { useHikeStore } from '../store/useHikeStore';
+import BiometricsPanel from './BiometricsPanel';
+import SafetyAlert from './SafetyAlert';
 import type {
   TileSourceConfig,
   TileSourceType,
   UserLocation,
   TrailPoint,
-  HikeStatus,
 } from '../types';
 
 /**
- * ============================================================
  * 高德在线瓦片源配置
- * ============================================================
- *
- * 高德瓦片 URL 模板说明：
- * - webrd01~04: 路网瓦片服务器集群（多节点负载均衡）
- * - webst01~04: 卫星瓦片服务器集群
- * - lang=zh_cn: 中文标注
- * - size=1: 256px 标准尺寸
- * - scale=1: 1x 分辨率（scale=2 为高清 Retina）
- * - style=7: 标准路网样式（含等高线、POI 标注）
- * - style=6: 卫星底图样式
- * - {x}/{y}/{z}: 标准 Web 墨卡托投影瓦片坐标
- *   x: 列号（从左到右）
- *   y: 行号（从上到下）
- *   z: 缩放级别（0-18）
  */
 const TILE_SOURCES: Record<TileSourceType, TileSourceConfig> = {
   standard: {
@@ -59,8 +46,7 @@ const TILE_SOURCES: Record<TileSourceType, TileSourceConfig> = {
 };
 
 /**
- * 地图初始中心点（北京天安门）
- * 后续会被用户实际定位覆盖
+ * 地图初始中心点
  */
 const INITIAL_REGION = {
   latitude: 39.9042,
@@ -69,76 +55,48 @@ const INITIAL_REGION = {
   longitudeDelta: 0.0421,
 };
 
-/**
- * 前台轮询间隔（毫秒）
- * 每隔此时间从后台任务缓冲区读取最新轨迹点
- */
+/** 前台轮询间隔 */
 const POLL_INTERVAL_MS = 1000;
 
-/**
- * RDP 抽稀容差（米）
- * 值越大抽稀越激进，渲染点越少，帧率越高
- */
+/** RDP 抽稀容差 */
 const RDP_EPSILON = 10;
 
 /**
  * MapContainer 地图容器组件
  *
- * 功能：
- * 1. 使用 react-native-maps 的 MapView 渲染地图底图
- * 2. 通过 UrlTile 加载高德在线瓦片（路网/卫星双图源）
- * 3. 支持图源一键切换
- * 4. 请求定位权限并显示用户当前位置蓝点
- * 5. 集成后台定位任务，实时渲染徒步轨迹 Polyline
- * 6. 提供开始/停止徒步的控制按钮
+ * 集成：高德瓦片 + 轨迹记录 + 体征面板 + 安全预警
  */
 function MapContainer() {
-  // ---- 图源状态 ----
+  // ---- Zustand Store ----
+  const {
+    hikeStatus,
+    currentPath,
+    totalDistance,
+    startTime,
+    startHike: storeStartHike,
+    stopHike: storeStopHike,
+    appendTrailPoints,
+    setTotalDistance,
+    setElevationGain,
+  } = useHikeStore();
 
-  /** 当前激活的图源类型，默认为标准路网 */
+  // ---- 本地 UI 状态 ----
+
   const [activeSource, setActiveSource] = useState<TileSourceType>('standard');
-
-  // ---- 定位状态 ----
-
-  /** 用户当前坐标 */
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
-
-  /** 定位权限是否已授予 */
   const [hasLocationPermission, setHasLocationPermission] = useState(false);
-
-  /** 是否正在加载定位 */
   const [isLoadingLocation, setIsLoadingLocation] = useState(true);
-
-  // ---- 徒步记录状态 ----
-
-  /** 当前徒步状态 */
-  const [hikeStatus, setHikeStatus] = useState<HikeStatus>('idle');
-
-  /** 经卡尔曼滤波 + RDP 抽稀后用于渲染的轨迹点 */
   const [displayPoints, setDisplayPoints] = useState<TrailPoint[]>([]);
-
-  /** 累计距离（米） */
-  const [totalDistance, setTotalDistance] = useState(0);
-
-  /** 徒步开始时间 */
-  const [startTime, setStartTime] = useState<number | null>(null);
-
-  /** 已用时间（秒） */
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   // ---- Refs ----
 
-  /** 前台卡尔曼滤波器实例（用于前台实时定位滤波） */
   const foregroundFilterRef = useRef<GpsKalmanFilter>(new GpsKalmanFilter());
-
-  /** 轮询定时器 ID */
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  /** 计时器定时器 ID */
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  /** MapView 引用，用于编程式控制地图视角 */
   const mapRef = useRef<MapView>(null);
+
+  const isRecording = hikeStatus === 'recording';
 
   // ---- 定位权限请求 ----
 
@@ -158,7 +116,7 @@ function MapContainer() {
         } else {
           Alert.alert(
             '定位权限未授予',
-            '请在系统设置中允许 SmartHike 访问您的位置，以便在地图上显示您的当前位置。',
+            '请在系统设置中允许 SmartHike 访问您的位置。',
             [{ text: '知道了' }],
           );
         }
@@ -170,11 +128,10 @@ function MapContainer() {
     })();
   }, []);
 
-  // ---- 前台轮询：从后台任务缓冲区读取轨迹数据 ----
+  // ---- 前台轮询：从后台缓冲区读取轨迹 ----
 
   useEffect(() => {
-    if (hikeStatus !== 'recording') {
-      // 非录制状态清除定时器
+    if (!isRecording) {
       if (pollTimerRef.current) {
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -182,14 +139,29 @@ function MapContainer() {
       return;
     }
 
-    // 每秒从后台缓冲区读取最新轨迹，经过 RDP 抽稀后更新渲染
     pollTimerRef.current = setInterval(() => {
       const bufferedPoints = getTrailBuffer();
       if (bufferedPoints.length > 0) {
-        // 对轨迹进行 RDP 抽稀，减少渲染点数保障 60fps
         const simplified = processTrail(bufferedPoints, RDP_EPSILON);
         setDisplayPoints(simplified);
-        setTotalDistance(getTotalDistance());
+        const dist = getTotalDistance();
+        setTotalDistance(dist);
+
+        // 计算累计海拔
+        let gain = 0;
+        for (let i = 1; i < bufferedPoints.length; i++) {
+          const prev = bufferedPoints[i - 1];
+          const curr = bufferedPoints[i];
+          if (prev.altitude !== null && prev.altitude !== undefined &&
+              curr.altitude !== null && curr.altitude !== undefined) {
+            const delta = curr.altitude - prev.altitude;
+            if (delta > 0) gain += delta;
+          }
+        }
+        setElevationGain(gain);
+
+        // 同步到 Zustand store（用于持久化）
+        appendTrailPoints(bufferedPoints.slice(currentPath.length));
       }
     }, POLL_INTERVAL_MS);
 
@@ -199,12 +171,12 @@ function MapContainer() {
         pollTimerRef.current = null;
       }
     };
-  }, [hikeStatus]);
+  }, [isRecording, currentPath.length]);
 
-  // ---- 计时器：记录徒步已用时间 ----
+  // ---- 计时器 ----
 
   useEffect(() => {
-    if (hikeStatus !== 'recording' || startTime === null) {
+    if (!isRecording || startTime === null) {
       if (elapsedTimerRef.current) {
         clearInterval(elapsedTimerRef.current);
         elapsedTimerRef.current = null;
@@ -222,7 +194,7 @@ function MapContainer() {
         elapsedTimerRef.current = null;
       }
     };
-  }, [hikeStatus, startTime]);
+  }, [isRecording, startTime]);
 
   // ---- 开始徒步 ----
 
@@ -232,27 +204,23 @@ function MapContainer() {
       return;
     }
 
-    // 重置轨迹缓冲区和滤波器状态
     resetTrailBuffer();
     foregroundFilterRef.current.reset();
     setDisplayPoints([]);
-    setTotalDistance(0);
     setElapsedSeconds(0);
 
-    // 启动后台定位服务
     const started = await startBackgroundLocation();
     if (!started) {
       Alert.alert(
         '后台定位启动失败',
-        '请检查是否已授予"始终允许"定位权限。Android 用户请确保在系统设置中开启后台定位。',
+        '请检查是否已授予"始终允许"定位权限。',
         [{ text: '知道了' }],
       );
       return;
     }
 
-    setStartTime(Date.now());
-    setHikeStatus('recording');
-  }, [hasLocationPermission]);
+    storeStartHike();
+  }, [hasLocationPermission, storeStartHike]);
 
   // ---- 停止徒步 ----
 
@@ -263,10 +231,8 @@ function MapContainer() {
         text: '确定结束',
         style: 'destructive',
         onPress: async () => {
-          // 停止后台定位
           await stopBackgroundLocation();
 
-          // 清除定时器
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -276,18 +242,16 @@ function MapContainer() {
             elapsedTimerRef.current = null;
           }
 
-          // 最终抽稀一次
           const finalPoints = getTrailBuffer();
           const simplified = processTrail(finalPoints, RDP_EPSILON);
           setDisplayPoints(simplified);
           setTotalDistance(getTotalDistance());
 
-          setHikeStatus('idle');
-          setStartTime(null);
+          storeStopHike();
         },
       },
     ]);
-  }, []);
+  }, [storeStopHike, setTotalDistance]);
 
   // ---- 图源切换 ----
 
@@ -295,7 +259,7 @@ function MapContainer() {
     setActiveSource((prev) => (prev === 'standard' ? 'satellite' : 'standard'));
   }, []);
 
-  // ---- 格式化时间 ----
+  // ---- 格式化工具 ----
 
   const formatTime = (seconds: number): string => {
     const h = Math.floor(seconds / 3600);
@@ -307,8 +271,6 @@ function MapContainer() {
     return `${m}:${String(s).padStart(2, '0')}`;
   };
 
-  // ---- 格式化距离 ----
-
   const formatDistance = (meters: number): string => {
     if (meters >= 1000) {
       return `${(meters / 1000).toFixed(2)} km`;
@@ -316,13 +278,7 @@ function MapContainer() {
     return `${Math.round(meters)} m`;
   };
 
-  // ---- 当前图源配置 ----
-
   const currentSource = TILE_SOURCES[activeSource];
-
-  // ---- 是否正在录制 ----
-
-  const isRecording = hikeStatus === 'recording';
 
   // ---- 渲染 ----
 
@@ -334,11 +290,7 @@ function MapContainer() {
         style={styles.map}
         initialRegion={
           userLocation
-            ? {
-                ...userLocation,
-                latitudeDelta: 0.0922,
-                longitudeDelta: 0.0421,
-              }
+            ? { ...userLocation, latitudeDelta: 0.0922, longitudeDelta: 0.0421 }
             : INITIAL_REGION
         }
         showsUserLocation={hasLocationPermission}
@@ -349,7 +301,6 @@ function MapContainer() {
         scrollEnabled
         zoomEnabled
       >
-        {/* 高德瓦片图层 */}
         <UrlTile
           urlTemplate={currentSource.urlTemplate}
           maximumZ={18}
@@ -357,7 +308,6 @@ function MapContainer() {
           flipY={false}
         />
 
-        {/* 徒步轨迹 Polyline 图层 */}
         {displayPoints.length >= 2 && (
           <Polyline
             coordinates={displayPoints.map((p) => ({
@@ -372,7 +322,7 @@ function MapContainer() {
         )}
       </MapView>
 
-      {/* 图源切换按钮（右上角） */}
+      {/* 图源切换按钮 */}
       <View style={styles.switchButtonContainer}>
         <TouchableOpacity
           style={styles.switchButton}
@@ -385,7 +335,7 @@ function MapContainer() {
         </TouchableOpacity>
       </View>
 
-      {/* 定位加载指示器（左上角） */}
+      {/* 定位加载指示器 */}
       {isLoadingLocation && (
         <View style={styles.loadingOverlay}>
           <ActivityIndicator size="small" color="#1890ff" />
@@ -393,7 +343,7 @@ function MapContainer() {
         </View>
       )}
 
-      {/* 徒步统计面板（顶部居中，录制时显示） */}
+      {/* 徒步统计面板 */}
       {isRecording && (
         <View style={styles.statsPanel}>
           <View style={styles.statsRow}>
@@ -415,6 +365,9 @@ function MapContainer() {
         </View>
       )}
 
+      {/* 体征控制面板（录制时显示） */}
+      <BiometricsPanel />
+
       {/* 底部控制按钮 */}
       <View style={styles.controlContainer}>
         {hikeStatus === 'idle' ? (
@@ -435,14 +388,13 @@ function MapContainer() {
           </TouchableOpacity>
         )}
       </View>
+
+      {/* 安全预警弹窗（全局覆盖） */}
+      <SafetyAlert />
     </View>
   );
 }
 
-/**
- * 使用 React.memo 包装组件，避免父组件重渲染时
- * 触发 MapView 不必要的重新挂载（MapView 重挂载开销极大）
- */
 export default memo(MapContainer);
 
 // ---- 样式定义 ----
