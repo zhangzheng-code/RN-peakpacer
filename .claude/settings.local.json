@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv /tmp/smarthike-backup/.claude /tmp/smarthike-backup/AGENTS.md /tmp/smarthike-backup/CLAUDE.md /tmp/smarthike-backup/PROGRESS.md /tmp/smarthike-backup/.gitignore .)",
+      "Bash(mv \"/tmp/smarthike-backup/Step-by-Step 全流程闭环开发指令.txt\" .)"
+    ]
+  }
+}

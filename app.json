@@ -1,4 +1,44 @@
 {
-  "name": "SmartHike",
-  "slug": "SmartHike"
+  "expo": {
+    "name": "SmartHike",
+    "slug": "SmartHike",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.smarthike.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "SmartHike 需要在后台持续获取您的位置以记录徒步轨迹。",
+        "UIBackgroundModes": ["location"]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "com.smarthike.app",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。"
+        }
+      ]
+    ]
+  }
 }
