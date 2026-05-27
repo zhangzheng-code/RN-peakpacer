@@ -22,7 +22,7 @@ jobs:
       - name: Setup Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "15.4"
+          xcode-version: "16.1"
       # 👆 --- 复制并插入这几行代码 --- 👆
 
       - name: Setup Node.js
