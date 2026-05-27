@@ -95,3 +95,19 @@ export interface PEIResult {
   /** 海拔分量 */
   altitudeComponent: number;
 }
+
+/**
+ * AI 聊天消息
+ */
+export interface ChatMessage {
+  /** 消息唯一 ID */
+  id: string;
+  /** 消息角色 */
+  role: 'user' | 'assistant' | 'system';
+  /** 消息文本内容 */
+  content: string;
+  /** 创建时间戳 */
+  timestamp: number;
+  /** 是否正在流式接收中 */
+  isStreaming?: boolean;
+}

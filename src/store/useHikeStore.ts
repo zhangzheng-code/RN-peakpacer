@@ -21,6 +21,7 @@ import type {
   HistoryTrack,
   UserProfile,
   BiometricsData,
+  ChatMessage,
 } from '../types';
 
 /**
@@ -104,6 +105,20 @@ interface HikeStoreState {
 
   /** 清空所有历史轨迹 */
   clearHistory: () => void;
+
+  // ---- AI 聊天记录 ----
+
+  /** AI 聊天消息列表 */
+  chatMessages: ChatMessage[];
+
+  /** 设置聊天消息 */
+  setChatMessages: (messages: ChatMessage[]) => void;
+
+  /** 追加聊天消息 */
+  appendChatMessage: (message: ChatMessage) => void;
+
+  /** 清空聊天记录 */
+  clearChatMessages: () => void;
 }
 
 /**
@@ -146,6 +161,7 @@ export const useHikeStore = create<HikeStoreState>()(
       biometrics: DEFAULT_BIOMETRICS,
       consecutiveAlertCount: 0,
       isAlertActive: false,
+      chatMessages: [],
 
       // ---- Actions 实现 ----
 
@@ -239,6 +255,20 @@ export const useHikeStore = create<HikeStoreState>()(
       clearHistory: () => {
         set({ historyTracks: [] });
       },
+
+      setChatMessages: (messages) => {
+        set({ chatMessages: messages });
+      },
+
+      appendChatMessage: (message) => {
+        set((prev) => ({
+          chatMessages: [...prev.chatMessages, message],
+        }));
+      },
+
+      clearChatMessages: () => {
+        set({ chatMessages: [] });
+      },
     }),
     {
       name: 'smarthike-store',
@@ -256,6 +286,7 @@ export const useHikeStore = create<HikeStoreState>()(
         historyTracks: state.historyTracks,
         profile: state.profile,
         biometrics: state.biometrics,
+        chatMessages: state.chatMessages,
       }),
     },
   ),
