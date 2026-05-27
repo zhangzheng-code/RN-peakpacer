@@ -18,6 +18,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 👇 --- 复制并插入这几行代码 --- 👇
+      - name: Setup Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "15.4"
+      # 👆 --- 复制并插入这几行代码 --- 👆
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
