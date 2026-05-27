@@ -36,9 +36,15 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。"
+          "locationAlwaysAndWhenInUsePermission": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。",
+          "locationAlwaysPermission": "SmartHike 需要在后台持续获取您的位置以记录徒步轨迹。",
+          "locationWhenInUsePermission": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true,
+          "isIosBackgroundLocationEnabled": true
         }
-      ]
+      ],
+      "expo-task-manager"
     ]
   }
 }
