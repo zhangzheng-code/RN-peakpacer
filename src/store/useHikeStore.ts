@@ -119,6 +119,30 @@ interface HikeStoreState {
 
   /** 清空聊天记录 */
   clearChatMessages: () => void;
+
+  // ---- 网格探索状态 ----
+
+  /**
+   * 已点亮网格集合
+   * 存储格式："latIndex,lngIndex"（如 "34263,108948"）
+   * 使用 Set 序列化为字符串数组以兼容 AsyncStorage
+   */
+  exploredGrids: string[];
+
+  /**
+   * 网格索引查找 Set（运行时，不持久化）
+   * 用于 O(1) 判断网格是否已探索
+   */
+  exploredGridSet: Set<string>;
+
+  /** 点亮网格 action */
+  exploreGrid: (lat: number, lng: number) => void;
+
+  /** 批量点亮网格（用于历史轨迹回放） */
+  exploreGridsBatch: (points: TrailPoint[]) => void;
+
+  /** 清空探索记录 */
+  clearExploredGrids: () => void;
 }
 
 /**
@@ -137,6 +161,22 @@ const DEFAULT_BIOMETRICS: BiometricsData = {
   currentHeartRate: 75,
   spo2: 98,
 };
+
+/**
+ * ============================================================
+ * 网格化配置
+ * ============================================================
+ *
+ * 网格尺寸：0.001° × 0.001°
+ * 在赤道附近约合 111m × 111m，中纬度约 85m × 111m
+ *
+ * 网格索引计算：
+ *   latIndex = Math.floor(latitude / GRID_SIZE)
+ *   lngIndex = Math.floor(longitude / GRID_SIZE)
+ *
+ * 使用 Set<string> 进行 O(1) 的已探索判定
+ */
+const GRID_SIZE = 0.001;
 
 /**
  * Zustand Store 创建
@@ -162,6 +202,8 @@ export const useHikeStore = create<HikeStoreState>()(
       consecutiveAlertCount: 0,
       isAlertActive: false,
       chatMessages: [],
+      exploredGrids: [],
+      exploredGridSet: new Set<string>(),
 
       // ---- Actions 实现 ----
 
@@ -269,6 +311,44 @@ export const useHikeStore = create<HikeStoreState>()(
       clearChatMessages: () => {
         set({ chatMessages: [] });
       },
+
+      exploreGrid: (lat, lng) => {
+        const latIndex = Math.floor(lat / GRID_SIZE);
+        const lngIndex = Math.floor(lng / GRID_SIZE);
+        const key = `${latIndex},${lngIndex}`;
+        const state = get();
+        if (state.exploredGridSet.has(key)) return;
+        const newSet = new Set(state.exploredGridSet);
+        newSet.add(key);
+        set({
+          exploredGrids: [...state.exploredGrids, key],
+          exploredGridSet: newSet,
+        });
+      },
+
+      exploreGridsBatch: (points) => {
+        const state = get();
+        const newSet = new Set(state.exploredGridSet);
+        const newKeys: string[] = [];
+        for (const p of points) {
+          const latIndex = Math.floor(p.latitude / GRID_SIZE);
+          const lngIndex = Math.floor(p.longitude / GRID_SIZE);
+          const key = `${latIndex},${lngIndex}`;
+          if (!newSet.has(key)) {
+            newSet.add(key);
+            newKeys.push(key);
+          }
+        }
+        if (newKeys.length === 0) return;
+        set({
+          exploredGrids: [...state.exploredGrids, ...newKeys],
+          exploredGridSet: newSet,
+        });
+      },
+
+      clearExploredGrids: () => {
+        set({ exploredGrids: [], exploredGridSet: new Set<string>() });
+      },
     }),
     {
       name: 'smarthike-store',
@@ -287,7 +367,17 @@ export const useHikeStore = create<HikeStoreState>()(
         profile: state.profile,
         biometrics: state.biometrics,
         chatMessages: state.chatMessages,
+        exploredGrids: state.exploredGrids,
       }),
+      /**
+       * onRehydrateStorage: 从 AsyncStorage 恢复后，
+       * 将 exploredGrids 数组重建为 Set 以支持 O(1) 查找
+       */
+      onRehydrateStorage: () => (state) => {
+        if (state && state.exploredGrids) {
+          state.exploredGridSet = new Set(state.exploredGrids);
+        }
+      },
     },
   ),
 );

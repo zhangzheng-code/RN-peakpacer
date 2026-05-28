@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Alert, ActivityIndicator, Modal } from 'react-native';
 import MapView, { UrlTile, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
@@ -19,6 +19,7 @@ import SafetyAlert from './SafetyAlert';
 import StatsHUD from './StatsHUD';
 import PEIOrb from './PEIOrb';
 import FloatingButtons from './FloatingButtons';
+import ExplorationGrids from './ExplorationGrids';
 import AIChatScreen from '../screens/AIChatScreen';
 import type { TileSourceConfig, TileSourceType, UserLocation, TrailPoint } from '../types';
 
@@ -50,18 +51,18 @@ const RDP_EPSILON = 10;
 function MapContainer() {
   const insets = useSafeAreaInsets();
 
-  const {
-    hikeStatus,
-    currentPath,
-    totalDistance,
-    startTime,
-    elevationGain,
-    startHike: storeStartHike,
-    stopHike: storeStopHike,
-    appendTrailPoints,
-    setTotalDistance,
-    setElevationGain,
-  } = useHikeStore();
+  // ---- Zustand selector subscriptions（精确订阅，切断无关状态的垃圾重绘） ----
+  const hikeStatus = useHikeStore((s) => s.hikeStatus);
+  const currentPath = useHikeStore((s) => s.currentPath);
+  const totalDistance = useHikeStore((s) => s.totalDistance);
+  const startTime = useHikeStore((s) => s.startTime);
+  const elevationGain = useHikeStore((s) => s.elevationGain);
+  const storeStartHike = useHikeStore((s) => s.startHike);
+  const storeStopHike = useHikeStore((s) => s.stopHike);
+  const appendTrailPoints = useHikeStore((s) => s.appendTrailPoints);
+  const setTotalDistance = useHikeStore((s) => s.setTotalDistance);
+  const setElevationGain = useHikeStore((s) => s.setElevationGain);
+  const exploreGridsBatch = useHikeStore((s) => s.exploreGridsBatch);
 
   const [activeSource, setActiveSource] = useState<TileSourceType>('standard');
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
@@ -139,7 +140,13 @@ function MapContainer() {
         }
         setElevationGain(gain);
 
-        appendTrailPoints(bufferedPoints.slice(currentPath.length));
+        const newPoints = bufferedPoints.slice(currentPath.length);
+        appendTrailPoints(newPoints);
+
+        // 批量点亮轨迹经过的网格
+        if (newPoints.length > 0) {
+          exploreGridsBatch(newPoints);
+        }
       }
     }, POLL_INTERVAL_MS);
 
@@ -149,7 +156,7 @@ function MapContainer() {
         pollTimerRef.current = null;
       }
     };
-  }, [isRecording, currentPath.length]);
+  }, [isRecording, currentPath.length, exploreGridsBatch]);
 
   // ---- Elapsed timer ----
   useEffect(() => {
@@ -223,11 +230,16 @@ function MapContainer() {
           setDisplayPoints(simplified);
           setTotalDistance(getTotalDistance());
 
+          // 点亮最后一批网格
+          if (finalPoints.length > 0) {
+            exploreGridsBatch(finalPoints);
+          }
+
           storeStopHike();
         },
       },
     ]);
-  }, [storeStopHike, setTotalDistance]);
+  }, [storeStopHike, setTotalDistance, exploreGridsBatch]);
 
   // ---- Switch tile source ----
   const handleSwitchSource = useCallback(() => {
@@ -244,6 +256,19 @@ function MapContainer() {
   }, []);
 
   const currentSource = TILE_SOURCES[activeSource];
+
+  /**
+   * useMemo 缓存 Polyline 坐标数组
+   * 避免每次 render 时重新 map 产生新引用导致 Polyline 重绘
+   */
+  const polylineCoordinates = useMemo(
+    () =>
+      displayPoints.map((p) => ({
+        latitude: p.latitude,
+        longitude: p.longitude,
+      })),
+    [displayPoints],
+  );
 
   return (
     <View className="flex-1 bg-black">
@@ -270,12 +295,11 @@ function MapContainer() {
           tileSize={256}
           flipY={false}
         />
-        {displayPoints.length >= 2 && (
+        {/* 已探索网格迷雾层 */}
+        <ExplorationGrids />
+        {polylineCoordinates.length >= 2 && (
           <Polyline
-            coordinates={displayPoints.map((p) => ({
-              latitude: p.latitude,
-              longitude: p.longitude,
-            }))}
+            coordinates={polylineCoordinates}
             strokeColor="#1890ff"
             strokeWidth={5}
             lineCap="round"
