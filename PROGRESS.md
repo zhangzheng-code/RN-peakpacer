@@ -21,14 +21,14 @@ Git 当前分支：feature/base-map
 
 [x] 自定义开发构建 (已完成)
 
-[ ] 地图探索点亮与性能调优 (进行中)
+[x ] 地图探索点亮与性能调优 (已完成)
 
 当前活跃的物理文件
 src/store/useHikeStore.ts
 
 src/components/MapContainer.tsx
 
-src/components/ExplorationGrids.tsx (即将创建)
+src/components/ExplorationGrids.tsx (已创建)
 
 上一次编译/运行状态
 状态：第四阶段原生升级完全通过，真机测试完美
