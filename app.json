@@ -12,7 +12,10 @@
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "SmartHike 需要在后台持续获取您的位置以记录徒步轨迹。",
-        "UIBackgroundModes": ["location"]
+        "UIBackgroundModes": [
+          "location"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -26,7 +29,12 @@
       "permissions": [
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION",
-        "ACCESS_BACKGROUND_LOCATION"
+        "ACCESS_BACKGROUND_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "web": {
@@ -45,6 +53,12 @@
         }
       ],
       "expo-task-manager"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "5ea677d5-c440-4f98-92ce-ef1202ef4e0e"
+      }
+    },
+    "owner": "zhangzheng11"
   }
 }
