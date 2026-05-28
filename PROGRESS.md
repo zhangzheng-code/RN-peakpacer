@@ -1,38 +1,42 @@
-SmartHike 项目开发进度板 (Local-First Architecture)
+SmartHike 项目高阶开发进度板 (Premium Visual & Native Integration)
 当前全局状态
-当前阶段：第五阶段 (Day 14-15) - 地图网格点亮与性能调优
+当前阶段：第六阶段 (二次高阶开发 - 视觉重构与 Tab 导航)
 
-当前目标：实现端侧经纬度网格探索度点亮算法，并攻克 Fabric 新架构下的地图渲染性能瓶颈，确保 60fps 运行
+当前目标：确立全新曜石黑与森林绿视觉，重构 Bottom Tab Bar 与 Gorhom Bottom Sheet
 
-Git 当前分支：feature/base-map
+Git 当前分支：feature/premium-redesign
 
 模块清单与实现状态
-[x] 基础框架与 Tailwind 样式配置 (已完成)
+[ ] 1. 视觉与导航系统 (Visual & Navigation)
 
-[x] MapContainer.tsx 高德瓦片渲染 (已完成)
+[ ] 接入 react-navigation 双端路由网格 (待开始)
 
-[x] Expo-Location 后台记录任务 (已完成)
+[ ] 实现自定义 SVG 曲线 + 悬浮 FAB 底部导航栏 (待开始)
 
-[x] Kalman & RDP 纠偏算法 (已完成)
+[ ] 集成 @gorhom/bottom-sheet 弹性手势抽屉 (待开始)
 
-[x] Zustand 状态持久化与 PEI 预警 (已完成)
+[ ] 2. 真实健康外设集成 (True Native Health)
 
-[x] DeepSeek API SSE 桥接 (已完成)
+[ ] 对接 iOS HealthKit & Android Health Connect 读取真实生理特征 (待开始)
 
-[x] 自定义开发构建 (已完成)
+[ ] 编写高能端侧 SVG 生理指标/PEI 实时滑动折线图 (待开始)
 
-[x ] 地图探索点亮与性能调优 (已完成)
+[ ] 3. 类小红书 UGC 与约伴社交 (Social Community)
+
+[ ] 跑通 GPX 轨迹挂载与一键导入同款路线逻辑 (待开始)
+
+[ ] 引入 FlashList 实现 60fps 流畅小红书攻略广场 (待开始)
+
+[ ] 实现“找搭子”约伴卡片与领队评价面板 (待开始)
+
+[ ] 4. 场景感知即时推荐 (Contextual Shop)
+
+[ ] 联动墨迹天气 API 与 PEI 指数，实现智能装备卡片动态滑入 (待开始)
 
 当前活跃的物理文件
-src/store/useHikeStore.ts
-
-src/components/MapContainer.tsx
-
-src/components/ExplorationGrids.tsx (已创建)
+无 (等待本轮研讨通过后开辟新分支)
 
 上一次编译/运行状态
-状态：第四阶段原生升级完全通过，真机测试完美
-
-功能测试：iPhone 后台定位蓝条显示正常，退后台/锁屏持续画线，PEI 触发时穿透勿扰推送通知且每 2 秒物理震动
+状态：主线 MVP 五大阶段全部完美通关，真机自定义构建测试无报错
 
 报错记录：无
