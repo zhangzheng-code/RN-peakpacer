@@ -9,8 +9,13 @@
  * - 推荐装备清单
  *
  * 同时触发：
- * - expo-haptics 系统级连续震动
- * - expo-notifications 本地常驻通知
+ * - expo-haptics 系统级连续震动（前台每 2 秒一次）
+ * - expo-notifications 本地常驻通知（后台每 2 秒重复推送）
+ *
+ * 后台策略：
+ *   iOS 进入后台后 setInterval 会被系统挂起，
+ *   因此使用重复本地通知作为后台唤醒手段，
+ *   每 2 秒推送一次带震动音效的通知，确保用户即使锁屏也能感知。
  */
 
 import React, { useEffect, useRef, useCallback, useMemo } from 'react';
@@ -22,6 +27,8 @@ import {
   ScrollView,
   Animated,
   Modal,
+  AppState,
+  Platform,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import * as Notifications from 'expo-notifications';
@@ -37,7 +44,7 @@ import {
 
 /**
  * 配置通知处理器
- * 当 App 在前台时也展示通知横幅
+ * 当 App 在前台时也展示通知横幅 + 播放声音
  */
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -50,13 +57,18 @@ Notifications.setNotificationHandler({
 });
 
 /**
+ * Android 通知渠道 ID
+ */
+const ALERT_CHANNEL_ID = 'smarthike-safety-alert';
+
+/**
  * 连续触发预警所需的次数
  * 避免单次偶发高 PEI 就触发警报
  */
 const CONSECUTIVE_THRESHOLD = 3;
 
 /**
- * 震动间隔（毫秒）
+ * 震动 / 通知间隔（毫秒）
  */
 const HAPTIC_INTERVAL_MS = 2000;
 
@@ -79,6 +91,9 @@ export default function SafetyAlert() {
   /** 脉冲动画值 */
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
+  /** 是否已创建 Android 通知渠道 */
+  const channelCreatedRef = useRef(false);
+
   /** 计算当前 PEI */
   const peiResult = useMemo(
     () => calculatePEI(profile, biometrics, elevationGain, 0.3),
@@ -100,7 +115,30 @@ export default function SafetyAlert() {
     [peiResult.level],
   );
 
-  /** 触发系统震动 */
+  /**
+   * 创建 Android 通知渠道（仅需执行一次）
+   * 设置为最高重要性 + 长震动模式，确保不被系统静默
+   */
+  const ensureChannel = useCallback(async () => {
+    if (Platform.OS !== 'android' || channelCreatedRef.current) return;
+    try {
+      if (typeof Notifications.setNotificationChannelAsync === 'function') {
+        await Notifications.setNotificationChannelAsync(ALERT_CHANNEL_ID, {
+          name: '安全预警',
+          importance: Notifications.AndroidImportance?.MAX ?? 5,
+          vibrationPattern: [0, 250, 250, 250],
+          lightColor: '#FF0000',
+          sound: 'default',
+          bypassDnd: true,
+        });
+        channelCreatedRef.current = true;
+      }
+    } catch (e) {
+      console.warn('[SafetyAlert] 创建通知渠道失败:', e);
+    }
+  }, []);
+
+  /** 触发系统震动（仅前台有效） */
   const triggerHapticFeedback = useCallback(async () => {
     try {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -109,7 +147,11 @@ export default function SafetyAlert() {
     }
   }, []);
 
-  /** 推送本地通知 */
+  /**
+   * 推送单条本地通知
+   * - Android: 走自建渠道，最高优先级，绕勿扰
+   * - iOS: interruptionLevel = timeSensitive，突破专注模式
+   */
   const sendAlertNotification = useCallback(async () => {
     try {
       await Notifications.scheduleNotificationAsync({
@@ -117,8 +159,9 @@ export default function SafetyAlert() {
           title: '⚠️ SmartHike 安全预警',
           body: `您的生理耗竭指数已达 ${peiResult.value}，请立即停止前进并休息！`,
           sound: true,
-          priority: Notifications.AndroidNotificationPriority.MAX,
-          sticky: true,
+          priority: Notifications.AndroidNotificationPriority?.MAX ?? 'max',
+          ...(Platform.OS === 'android' ? { channelId: ALERT_CHANNEL_ID } : {}),
+          ...(Platform.OS === 'ios' ? { interruptionLevel: 'timeSensitive' as const } : {}),
         },
         trigger: null,
       });
@@ -127,7 +170,27 @@ export default function SafetyAlert() {
     }
   }, [peiResult.value]);
 
-  /** 启动连续震动循环 */
+  /**
+   * 启动重复通知循环（后台持续唤醒手段）
+   * 每 2 秒推送一条本地通知，带震动 + 音效
+   * iOS 进入后台后 setInterval 会被挂起，但本地通知由系统调度，不受影响
+   */
+  const startNotificationLoop = useCallback(() => {
+    sendAlertNotification();
+    const id = setInterval(() => {
+      sendAlertNotification();
+    }, HAPTIC_INTERVAL_MS);
+    return id;
+  }, [sendAlertNotification]);
+
+  /** 停止通知循环 */
+  const stopNotificationLoop = useCallback((id: ReturnType<typeof setInterval> | null) => {
+    if (id !== null) {
+      clearInterval(id);
+    }
+  }, []);
+
+  /** 启动前台震动循环 */
   const startHapticLoop = useCallback(() => {
     triggerHapticFeedback();
     hapticTimerRef.current = setInterval(() => {
@@ -140,6 +203,20 @@ export default function SafetyAlert() {
     if (hapticTimerRef.current) {
       clearInterval(hapticTimerRef.current);
       hapticTimerRef.current = null;
+    }
+  }, []);
+
+  /** 取消所有已发出的安全预警通知 */
+  const cancelAllAlertNotifications = useCallback(async () => {
+    try {
+      const presented = await Notifications.getPresentedNotificationsAsync();
+      for (const n of presented) {
+        if (n.request.content.title?.includes('SmartHike')) {
+          await Notifications.dismissNotificationAsync(n.request.identifier);
+        }
+      }
+    } catch (error) {
+      console.warn('[SafetyAlert] 取消通知失败:', error);
     }
   }, []);
 
@@ -162,6 +239,20 @@ export default function SafetyAlert() {
   }, [pulseAnim]);
 
   /**
+   * 初始化：创建 Android 通知渠道 + 请求通知权限
+   */
+  useEffect(() => {
+    ensureChannel();
+    Notifications.requestPermissionsAsync();
+  }, []);
+
+  /**
+   * 通知循环定时器引用
+   * 与 hapticTimerRef 分开，因为通知循环独立于震动循环
+   */
+  const notifTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /**
    * PEI 监控效果
    * 每次 biometrics 或 elevationGain 变化时检查是否需要触发/解除警报
    */
@@ -170,6 +261,8 @@ export default function SafetyAlert() {
       resetAlertCount();
       setAlertActive(false);
       stopHapticLoop();
+      stopNotificationLoop(notifTimerRef.current);
+      notifTimerRef.current = null;
       return;
     }
 
@@ -180,6 +273,9 @@ export default function SafetyAlert() {
       if (isAlertActive) {
         setAlertActive(false);
         stopHapticLoop();
+        stopNotificationLoop(notifTimerRef.current);
+        notifTimerRef.current = null;
+        cancelAllAlertNotifications();
       }
     }
   }, [biometrics, elevationGain, hikeStatus]);
@@ -191,24 +287,47 @@ export default function SafetyAlert() {
     if (consecutiveAlertCount >= CONSECUTIVE_THRESHOLD && !isAlertActive) {
       setAlertActive(true);
       startHapticLoop();
-      sendAlertNotification();
+      notifTimerRef.current = startNotificationLoop();
       startPulseAnimation();
     }
   }, [consecutiveAlertCount]);
 
-  /** 组件卸载时清理 */
+  /**
+   * 监听 AppState：App 从后台回到前台时重启震动循环
+   *
+   * 问题：iOS 后台会挂起 setInterval，导致震动定时器停止。
+   * 通知由系统调度不受影响，但震动只在前台有效。
+   * 因此在 app 回到前台时立即重启震动循环。
+   */
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && isAlertActive) {
+        stopHapticLoop();
+        startHapticLoop();
+      }
+    });
+    return () => sub.remove();
+  }, [isAlertActive]);
+
+  /** 组件卸载时清理所有定时器和通知 */
   useEffect(() => {
     return () => {
       stopHapticLoop();
+      stopNotificationLoop(notifTimerRef.current);
+      notifTimerRef.current = null;
+      cancelAllAlertNotifications();
     };
   }, []);
 
-  /** 关闭警报 */
-  const handleDismiss = useCallback(() => {
+  /** 关闭警报（用户点击"我已知晓"） */
+  const handleDismiss = useCallback(async () => {
     setAlertActive(false);
     stopHapticLoop();
+    stopNotificationLoop(notifTimerRef.current);
+    notifTimerRef.current = null;
     resetAlertCount();
-  }, []);
+    await cancelAllAlertNotifications();
+  }, [cancelAllAlertNotifications, resetAlertCount, stopHapticLoop, stopNotificationLoop]);
 
   if (!isAlertActive) {
     return null;
@@ -229,11 +348,11 @@ export default function SafetyAlert() {
         >
           {/* 头部警报标题 */}
           <View style={[styles.header, { backgroundColor: peiColor }]}>
-            <Text style={styles.headerIcon}>🚨</Text>
+            <Text style={styles.headerIcon}>{"\u{1F6A8}"}</Text>
             <View style={styles.headerTextContainer}>
-              <Text style={styles.headerTitle}>极限耗竭警报</Text>
+              <Text style={styles.headerTitle}>{"极限耗竭警报"}</Text>
               <Text style={styles.headerSubtitle}>
-                PEI {peiResult.value} · {getPEILabel(peiResult.level)}
+                PEI {peiResult.value} {"·"} {getPEILabel(peiResult.level)}
               </Text>
             </View>
           </View>
@@ -244,30 +363,30 @@ export default function SafetyAlert() {
           >
             {/* PEI 分量分解 */}
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>体征分析</Text>
+              <Text style={styles.sectionTitle}>{"体征分析"}</Text>
               <View style={styles.metricsRow}>
                 <View style={styles.metricItem}>
                   <Text style={styles.metricValue}>
                     {Math.round(biometrics.currentHeartRate)}
                   </Text>
-                  <Text style={styles.metricLabel}>心率 bpm</Text>
+                  <Text style={styles.metricLabel}>{"心率 bpm"}</Text>
                 </View>
                 <View style={styles.metricItem}>
                   <Text style={styles.metricValue}>{biometrics.spo2}%</Text>
-                  <Text style={styles.metricLabel}>血氧 SpO₂</Text>
+                  <Text style={styles.metricLabel}>{"血氧 SpO₂"}</Text>
                 </View>
                 <View style={styles.metricItem}>
                   <Text style={styles.metricValue}>
                     {Math.round(elevationGain)}m
                   </Text>
-                  <Text style={styles.metricLabel}>累计爬升</Text>
+                  <Text style={styles.metricLabel}>{"累计爬升"}</Text>
                 </View>
               </View>
             </View>
 
             {/* 应急自救方案 */}
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>应急自救方案</Text>
+              <Text style={styles.sectionTitle}>{"应急自救方案"}</Text>
               {emergencyTips.map((tip, index) => (
                 <View key={index} style={styles.tipRow}>
                   <View style={styles.tipNumber}>
@@ -281,7 +400,7 @@ export default function SafetyAlert() {
             {/* 推荐装备 */}
             {recommendedGear.length > 0 && (
               <View style={styles.section}>
-                <Text style={styles.sectionTitle}>推荐应急装备</Text>
+                <Text style={styles.sectionTitle}>{"推荐应急装备"}</Text>
                 {recommendedGear.map((gear, index) => (
                   <View key={index} style={styles.gearRow}>
                     <Text style={styles.gearIcon}>{gear.icon}</Text>
@@ -301,7 +420,7 @@ export default function SafetyAlert() {
             onPress={handleDismiss}
             activeOpacity={0.8}
           >
-            <Text style={styles.dismissButtonText}>我已知晓，立即休息</Text>
+            <Text style={styles.dismissButtonText}>{"我已知晓，立即休息"}</Text>
           </TouchableOpacity>
         </Animated.View>
       </View>
