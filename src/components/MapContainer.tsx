@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
-import { StyleSheet, View, Text, ActivityIndicator, Pressable, Alert } from 'react-native';
+import { StyleSheet, View, Text, ActivityIndicator, Pressable, Alert, Dimensions, Platform } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import Animated, {
   useSharedValue,
@@ -264,9 +264,11 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   const [displayPoints, setDisplayPoints] = useState<TrailPoint[]>([]);
   const [loadingDismissed, setLoadingDismissed] = useState(false);
   const [mapReady, setMapReady] = useState(false);
+  const [screenDimensions, setScreenDimensions] = useState(Dimensions.get('window'));
 
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const webViewRef = useRef<WebView>(null);
+  const isMountedRef = useRef(true);
   const trailCoordsRef = useRef<Array<[number, number]>>([]);
 
   const loadingOpacity = useSharedValue(1);
@@ -305,7 +307,9 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       const msg = JSON.parse(event.nativeEvent.data);
       switch (msg.type) {
         case 'mapReady':
-          setMapReady(true);
+          if (isMountedRef.current) {
+            setMapReady(true);
+          }
           break;
         case 'error':
           console.warn('Leaflet error:', msg.data);
@@ -484,14 +488,43 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   // ---- HTML source (memoized, never changes) ----
   const htmlSource = useRef({ html: buildLeafletHTML() }).current;
 
+  // ---- Dimension change listener ----
+  useEffect(() => {
+    const subscription = Dimensions.addEventListener('change', ({ window }) => {
+      if (isMountedRef.current) {
+        setScreenDimensions(window);
+      }
+    });
+    return () => {
+      subscription?.remove();
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // ---- WebView lifecycle handlers ----
+  const handleWebViewLoadStart = useCallback(() => {
+    // WebView started loading — reset mapReady so effects wait for re-initialization
+    if (isMountedRef.current) {
+      setMapReady(false);
+    }
+  }, []);
+
+  const handleWebViewLoad = useCallback(() => {
+    // WebView finished loading — mapReady will be set via 'mapReady' message from JS
+  }, []);
+
+  const { width: SCREEN_W, height: SCREEN_H } = screenDimensions;
+
   return (
     <View style={styles.root}>
-      {/* WebView Leaflet Map — absoluteFill ensures it never collapses */}
+      {/* WebView Leaflet Map — explicit dimensions prevent collapse on re-render */}
       <WebView
         ref={webViewRef}
         source={htmlSource}
-        style={StyleSheet.absoluteFillObject}
+        style={{ width: SCREEN_W, height: SCREEN_H }}
         onMessage={handleWebViewMessage}
+        onLoadStart={handleWebViewLoadStart}
+        onLoadEnd={handleWebViewLoad}
         javaScriptEnabled
         domStorageEnabled
         allowsInlineMediaPlayback
@@ -500,6 +533,8 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         bounces={false}
         overScrollMode="never"
         originWhitelist={['*']}
+        setSupportMultipleWindows={false}
+        androidLayerType="hardware"
       />
 
       {/* GPS Loading Overlay — double-tap to bypass */}
@@ -531,8 +566,13 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
 
 const styles = StyleSheet.create({
   root: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: '#121314',
+    zIndex: 0,
   },
   loadingCenter: {
     flex: 1,

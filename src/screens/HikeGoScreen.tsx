@@ -220,6 +220,7 @@ export default function HikeGoScreen() {
         handleIndicatorStyle={styles.handleIndicator}
         enableOverDrag={false}
         enablePanDownToClose={false}
+        containerStyle={styles.sheetContainer}
       >
         <BottomSheetScrollView
           contentContainerStyle={styles.scrollContent}
@@ -365,6 +366,11 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: '#121314',
+    overflow: 'hidden',
+  },
+  sheetContainer: {
+    zIndex: 10,
+    elevation: 10,
   },
   sheetBackground: {
     backgroundColor: '#1A1B1E',
