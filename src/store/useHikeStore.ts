@@ -143,6 +143,20 @@ interface HikeStoreState {
 
   /** 清空探索记录 */
   clearExploredGrids: () => void;
+
+  // ---- 导航 / UI 状态 ----
+
+  /** 当前活跃的 Tab 名称 */
+  currentTab: string;
+
+  /** 底部 Tab 栏是否可见（用于 BottomSheet 展开时隐藏） */
+  isTabBarVisible: boolean;
+
+  /** 设置当前 Tab */
+  setCurrentTab: (tab: string) => void;
+
+  /** 设置 Tab 栏可见性 */
+  setTabBarVisible: (visible: boolean) => void;
 }
 
 /**
@@ -204,6 +218,8 @@ export const useHikeStore = create<HikeStoreState>()(
       chatMessages: [],
       exploredGrids: [],
       exploredGridSet: new Set<string>(),
+      currentTab: 'HikeGo',
+      isTabBarVisible: true,
 
       // ---- Actions 实现 ----
 
@@ -348,6 +364,14 @@ export const useHikeStore = create<HikeStoreState>()(
 
       clearExploredGrids: () => {
         set({ exploredGrids: [], exploredGridSet: new Set<string>() });
+      },
+
+      setCurrentTab: (tab) => {
+        set({ currentTab: tab });
+      },
+
+      setTabBarVisible: (visible) => {
+        set({ isTabBarVisible: visible });
       },
     }),
     {

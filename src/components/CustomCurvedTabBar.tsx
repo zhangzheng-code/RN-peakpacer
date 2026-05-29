@@ -13,6 +13,7 @@ import Svg, { Path } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
 import { BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useHikeStore } from '../store/useHikeStore';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -36,6 +37,8 @@ const TAB_CONFIG = [
   { key: 'Footprints', label: '足迹', icon: '👣' },
 ];
 
+const HIDE_TRANSLATE_Y = 120;
+
 export default function CustomCurvedTabBar({
   state,
   descriptors,
@@ -43,6 +46,7 @@ export default function CustomCurvedTabBar({
 }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
   const glowAnim = useRef(new Animated.Value(0)).current;
+  const hideAnim = useRef(new Animated.Value(0)).current;
 
   const W = SCREEN_WIDTH;
   const H = BAR_HEIGHT;
@@ -51,10 +55,32 @@ export default function CustomCurvedTabBar({
   const ND = NOTCH_DEPTH;
   const cx = W / 2;
 
+  // ---- Subscribe to Zustand isTabBarVisible ----
+  const isTabBarVisible = useHikeStore((s) => s.isTabBarVisible);
+  const setCurrentTab = useHikeStore((s) => s.setCurrentTab);
+
+  // ---- Animate tab bar hide/show ----
+  useEffect(() => {
+    Animated.spring(hideAnim, {
+      toValue: isTabBarVisible ? 0 : HIDE_TRANSLATE_Y,
+      useNativeDriver: true,
+      tension: 60,
+      friction: 10,
+    }).start();
+  }, [isTabBarVisible, hideAnim]);
+
+  // ---- Track current tab in Zustand ----
+  useEffect(() => {
+    const currentRoute = state.routes[state.index];
+    if (currentRoute) {
+      setCurrentTab(currentRoute.name);
+    }
+  }, [state.index, state.routes, setCurrentTab]);
+
   // Notch geometry: semicircle dip at the top edge center
   const notchLeftX = cx - NR;
   const notchRightX = cx + NR;
-  const cpOffset = NR * 0.5523; // quarter-circle Bézier approximation
+  const cpOffset = NR * 0.5523;
 
   // SVG path: bar outline with notch cut out of the top edge
   const barPath = [
@@ -157,9 +183,19 @@ export default function CustomCurvedTabBar({
   const isHikeFocused = state.routes[state.index]?.name === 'HikeGo';
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+    <Animated.View
+      pointerEvents="box-none"
+      style={[
+        styles.container,
+        {
+          paddingBottom: insets.bottom,
+          height: H + insets.bottom,
+          transform: [{ translateY: hideAnim }],
+        },
+      ]}
+    >
       {/* Bar background with SVG notch */}
-      <Svg width={W} height={H} style={styles.svgBackground}>
+      <Svg width={W} height={H} style={styles.svgBackground} pointerEvents="none">
         <Path d={barPath} fill={BG_COLOR} />
       </Svg>
 
@@ -167,6 +203,7 @@ export default function CustomCurvedTabBar({
       <BlurView
         intensity={40}
         tint="dark"
+        pointerEvents="none"
         style={[styles.blurOverlay, { width: W, height: H }]}
       />
 
@@ -218,7 +255,7 @@ export default function CustomCurvedTabBar({
           <Text style={styles.fabLabel}>Hike</Text>
         </TouchableOpacity>
       </View>
-    </View>
+    </Animated.View>
   );
 }
 
@@ -229,6 +266,8 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     backgroundColor: 'transparent',
+    zIndex: 99,
+    elevation: 20,
   },
   svgBackground: {
     position: 'absolute',

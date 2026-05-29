@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Alert, ActivityIndicator, Modal } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Alert, ActivityIndicator, Modal, Pressable } from 'react-native';
 import MapView, { UrlTile, Polyline } from 'react-native-maps';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+  runOnJS,
+} from 'react-native-reanimated';
+import { BlurView } from 'expo-blur';
 import * as Location from 'expo-location';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -39,19 +46,31 @@ const TILE_SOURCES: Record<TileSourceType, TileSourceConfig> = {
 };
 
 const INITIAL_REGION = {
-  latitude: 39.9042,
-  longitude: 116.4074,
+  latitude: 34.2635,
+  longitude: 108.948,
   latitudeDelta: 0.0922,
   longitudeDelta: 0.0421,
 };
 
 const POLL_INTERVAL_MS = 1000;
 const RDP_EPSILON = 10;
+const GPS_TIMEOUT_MS = 5000;
+const DEBUG_DEFAULT_LOCATION: UserLocation = { latitude: 30.25, longitude: 120.15 };
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
 
 function MapContainer() {
   const insets = useSafeAreaInsets();
 
-  // ---- Zustand selector subscriptions（精确订阅，切断无关状态的垃圾重绘） ----
+  // ---- Zustand selector subscriptions ----
   const hikeStatus = useHikeStore((s) => s.hikeStatus);
   const currentPath = useHikeStore((s) => s.currentPath);
   const totalDistance = useHikeStore((s) => s.totalDistance);
@@ -67,44 +86,116 @@ function MapContainer() {
   const [activeSource, setActiveSource] = useState<TileSourceType>('standard');
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
   const [hasLocationPermission, setHasLocationPermission] = useState(false);
-  const [isLoadingLocation, setIsLoadingLocation] = useState(true);
   const [displayPoints, setDisplayPoints] = useState<TrailPoint[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isAIChatVisible, setIsAIChatVisible] = useState(false);
+  const [loadingDismissed, setLoadingDismissed] = useState(false);
 
   const foregroundFilterRef = useRef<GpsKalmanFilter>(new GpsKalmanFilter());
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mapRef = useRef<MapView>(null);
 
+  // ---- Reanimated loading overlay fade ----
+  const loadingOpacity = useSharedValue(1);
+
+  const loadingAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: loadingOpacity.value,
+    pointerEvents: loadingOpacity.value > 0.01 ? 'auto' : 'none',
+  }));
+
+  const dismissLoadingOverlay = useCallback(() => {
+    loadingOpacity.value = withTiming(0, { duration: 300 }, (finished) => {
+      if (finished) {
+        runOnJS(setLoadingDismissed)(true);
+      }
+    });
+  }, [loadingOpacity]);
+
   const isRecording = hikeStatus === 'recording';
 
-  // ---- Location permission ----
+  // ---- Debug bypass: double-tap loading overlay to mock location ----
+  const lastTapRef = useRef(0);
+  const handleLoadingDoubleTap = useCallback(() => {
+    const now = Date.now();
+    if (now - lastTapRef.current < 300) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setUserLocation(DEBUG_DEFAULT_LOCATION);
+      dismissLoadingOverlay();
+      mapRef.current?.animateToRegion({
+        ...DEBUG_DEFAULT_LOCATION,
+        latitudeDelta: 0.0922,
+        longitudeDelta: 0.0421,
+      }, 500);
+    }
+    lastTapRef.current = now;
+  }, [dismissLoadingOverlay]);
+
+  // ---- Location permission with timeout & fallback ----
   useEffect(() => {
+    let cancelled = false;
+
     (async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status === 'granted') {
-          setHasLocationPermission(true);
-          const location = await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.Balanced,
-          });
-          setUserLocation({
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-          });
-        } else {
+        if (cancelled) return;
+
+        if (status !== 'granted') {
           Alert.alert('定位权限未授予', '请在系统设置中允许 SmartHike 访问您的位置。', [
             { text: '知道了' },
           ]);
+          dismissLoadingOverlay();
+          return;
         }
+
+        setHasLocationPermission(true);
+
+        // Try balanced accuracy with 5s timeout
+        let coords: UserLocation | null = null;
+        try {
+          const location = await withTimeout(
+            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+            GPS_TIMEOUT_MS,
+          );
+          coords = { latitude: location.coords.latitude, longitude: location.coords.longitude };
+        } catch {
+          // Fallback: low-power network triangulation
+          try {
+            const location = await withTimeout(
+              Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low }),
+              GPS_TIMEOUT_MS,
+            );
+            coords = { latitude: location.coords.latitude, longitude: location.coords.longitude };
+          } catch {
+            // Both failed — use last known location if available
+            const last = await Location.getLastKnownPositionAsync();
+            if (last) {
+              coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
+            }
+          }
+        }
+
+        if (cancelled) return;
+
+        if (coords) {
+          setUserLocation(coords);
+          mapRef.current?.animateToRegion({
+            ...coords,
+            latitudeDelta: 0.0922,
+            longitudeDelta: 0.0421,
+          }, 500);
+        }
+        dismissLoadingOverlay();
       } catch (error) {
-        console.warn('获取定位失败:', error);
-      } finally {
-        setIsLoadingLocation(false);
+        if (!cancelled) {
+          console.warn('获取定位失败:', error);
+          dismissLoadingOverlay();
+        }
       }
     })();
-  }, []);
+
+    return () => { cancelled = true; };
+  }, [dismissLoadingOverlay]);
 
   // ---- Foreground polling ----
   useEffect(() => {
@@ -143,7 +234,6 @@ function MapContainer() {
         const newPoints = bufferedPoints.slice(currentPath.length);
         appendTrailPoints(newPoints);
 
-        // 批量点亮轨迹经过的网格
         if (newPoints.length > 0) {
           exploreGridsBatch(newPoints);
         }
@@ -230,7 +320,6 @@ function MapContainer() {
           setDisplayPoints(simplified);
           setTotalDistance(getTotalDistance());
 
-          // 点亮最后一批网格
           if (finalPoints.length > 0) {
             exploreGridsBatch(finalPoints);
           }
@@ -257,10 +346,6 @@ function MapContainer() {
 
   const currentSource = TILE_SOURCES[activeSource];
 
-  /**
-   * useMemo 缓存 Polyline 坐标数组
-   * 避免每次 render 时重新 map 产生新引用导致 Polyline 重绘
-   */
   const polylineCoordinates = useMemo(
     () =>
       displayPoints.map((p) => ({
@@ -271,8 +356,8 @@ function MapContainer() {
   );
 
   return (
-    <View className="flex-1 bg-black">
-      {/* Full-screen immersive map */}
+    <View className="flex-1 bg-[#121314]">
+      {/* Full-screen immersive map — always mounted, never blocked */}
       <MapView
         ref={mapRef}
         style={StyleSheet.absoluteFill}
@@ -295,7 +380,6 @@ function MapContainer() {
           tileSize={256}
           flipY={false}
         />
-        {/* 已探索网格迷雾层 */}
         <ExplorationGrids />
         {polylineCoordinates.length >= 2 && (
           <Polyline
@@ -308,23 +392,73 @@ function MapContainer() {
         )}
       </MapView>
 
-      {/* Loading indicator */}
-      {isLoadingLocation && (
-        <View
-          className="absolute left-4 flex-row items-center px-3 py-2 rounded-full"
-          style={{
-            top: insets.top + 8,
-            backgroundColor: 'rgba(255,255,255,0.9)',
-            shadowColor: '#000',
-            shadowOffset: { width: 0, height: 1 },
-            shadowOpacity: 0.1,
-            shadowRadius: 4,
-            elevation: 3,
-          }}
+      {/* Glass Loading Overlay — fades out on first GPS fix; double-tap to bypass */}
+      {!loadingDismissed && (
+        <Animated.View
+          style={[
+            StyleSheet.absoluteFill,
+            loadingAnimatedStyle,
+            { zIndex: 50 },
+          ]}
+          pointerEvents={userLocation ? 'none' : 'auto'}
         >
-          <ActivityIndicator size="small" color="#1890ff" />
-          <Text className="ml-2 text-sm text-muted">正在获取定位...</Text>
-        </View>
+          <BlurView intensity={60} tint="dark" style={StyleSheet.absoluteFill}>
+            <Pressable
+              style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(18,19,20,0.6)' }]}
+              onPress={handleLoadingDoubleTap}
+            >
+              <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+                <View
+                  style={{
+                    width: 200,
+                    paddingVertical: 28,
+                    borderRadius: 24,
+                    backgroundColor: 'rgba(255,255,255,0.06)',
+                    borderWidth: 1,
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    alignItems: 'center',
+                    shadowColor: '#000',
+                    shadowOffset: { width: 0, height: 8 },
+                    shadowOpacity: 0.3,
+                    shadowRadius: 24,
+                    elevation: 16,
+                  }}
+                >
+                  <ActivityIndicator size="large" color="#10B981" />
+                  <Text
+                    style={{
+                      marginTop: 16,
+                      fontSize: 14,
+                      fontWeight: '600',
+                      color: 'rgba(255,255,255,0.7)',
+                      letterSpacing: 1,
+                    }}
+                  >
+                    正在搜星定位...
+                  </Text>
+                  <Text
+                    style={{
+                      marginTop: 6,
+                      fontSize: 11,
+                      color: 'rgba(255,255,255,0.35)',
+                    }}
+                  >
+                    Acquiring GPS signal
+                  </Text>
+                  <Text
+                    style={{
+                      marginTop: 10,
+                      fontSize: 9,
+                      color: 'rgba(255,255,255,0.2)',
+                    }}
+                  >
+                    双击跳过 · Double-tap to skip
+                  </Text>
+                </View>
+              </View>
+            </Pressable>
+          </BlurView>
+        </Animated.View>
       )}
 
       {/* Top Glassmorphic HUD */}
