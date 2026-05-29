@@ -190,7 +190,7 @@ export default function HikeGoScreen() {
   return (
     <GestureHandlerRootView style={styles.root}>
       {/* Background: pure map (absoluteFill, sibling) */}
-      <MapContainer />
+      <MapContainer tileSource={activeSource} />
 
       {/* Absolute overlay: HUD + Orb + Floating buttons (siblings of map) */}
       {isRecording && (
