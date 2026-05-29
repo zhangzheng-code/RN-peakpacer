@@ -1,12 +1,11 @@
-import React, { useCallback, useMemo, useRef, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import React, { useCallback, useMemo, useRef, useEffect, useState } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, Modal } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import BottomSheet, { BottomSheetScrollView } from '@gorhom/bottom-sheet';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
   withSpring,
-  useAnimatedReaction,
   interpolate,
   Extrapolation,
 } from 'react-native-reanimated';
@@ -15,9 +14,20 @@ import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapContainer from '../components/MapContainer';
 import BiometricsChart from '../components/BiometricsChart';
+import StatsHUD from '../components/StatsHUD';
+import PEIOrb from '../components/PEIOrb';
+import FloatingButtons from '../components/FloatingButtons';
+import SafetyAlert from '../components/SafetyAlert';
+import AIChatScreen from './AIChatScreen';
 import { useHikeStore } from '../store/useHikeStore';
 import { calculatePEI, getPEIColor, getPEILabel } from '../utils/healthCalculator';
 import { startHealthDataStream, stopHealthDataStream } from '../services/healthService';
+import {
+  startBackgroundLocation,
+  stopBackgroundLocation,
+  resetTrailBuffer,
+} from '../tasks/backgroundLocationTask';
+import type { TileSourceType } from '../types';
 
 export default function HikeGoScreen() {
   const insets = useSafeAreaInsets();
@@ -33,14 +43,18 @@ export default function HikeGoScreen() {
   const totalDistance = useHikeStore((s) => s.totalDistance);
   const startTime = useHikeStore((s) => s.startTime);
   const setTabBarVisible = useHikeStore((s) => s.setTabBarVisible);
-  const startHike = useHikeStore((s) => s.startHike);
-  const stopHike = useHikeStore((s) => s.stopHike);
+  const storeStartHike = useHikeStore((s) => s.startHike);
+  const storeStopHike = useHikeStore((s) => s.stopHike);
   const updateBiometrics = useHikeStore((s) => s.updateBiometrics);
   const addBiometricsRecord = useHikeStore((s) => s.addBiometricsRecord);
   const biometricsHistory = useHikeStore((s) => s.biometricsHistory);
   const clearBiometricsHistory = useHikeStore((s) => s.clearBiometricsHistory);
 
   const isRecording = hikeStatus === 'recording';
+
+  // ---- Tile source state ----
+  const [activeSource, setActiveSource] = useState<TileSourceType>('standard');
+  const [isAIChatVisible, setIsAIChatVisible] = useState(false);
 
   // ---- Health data stream lifecycle ----
   useEffect(() => {
@@ -81,8 +95,8 @@ export default function HikeGoScreen() {
   const peiColor = useMemo(() => getPEIColor(peiResult.level), [peiResult.level]);
   const peiLabel = useMemo(() => getPEILabel(peiResult.level), [peiResult.level]);
 
-  // ---- Elapsed time (for display inside drawer) ----
-  const [elapsedSeconds, setElapsedSeconds] = React.useState(0);
+  // ---- Elapsed time ----
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   useEffect(() => {
     if (!isRecording || startTime === null) {
@@ -123,20 +137,77 @@ export default function HikeGoScreen() {
     [setTabBarVisible],
   );
 
-  // ---- Handle start/stop from drawer ----
-  const handleToggleHike = useCallback(async () => {
+  // ---- Start hike (with background location) ----
+  const handleStartHike = useCallback(async () => {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    if (isRecording) {
-      stopHike();
-    } else {
-      startHike();
+
+    resetTrailBuffer();
+    storeStartHike();
+
+    const started = await startBackgroundLocation();
+    if (!started) {
+      Alert.alert('后台定位启动失败', '请检查是否已授予"始终允许"定位权限。', [
+        { text: '知道了' },
+      ]);
     }
-  }, [isRecording, startHike, stopHike]);
+  }, [storeStartHike]);
+
+  // ---- Stop hike (with background location) ----
+  const handleStopHike = useCallback(async () => {
+    Alert.alert('结束徒步', '确定要结束本次徒步记录吗？', [
+      { text: '取消', style: 'cancel' },
+      {
+        text: '确定结束',
+        style: 'destructive',
+        onPress: async () => {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          await stopBackgroundLocation();
+          storeStopHike();
+        },
+      },
+    ]);
+  }, [storeStopHike]);
+
+  // ---- Floating button handlers ----
+  const handleSwitchSource = useCallback(() => {
+    setActiveSource((prev) => (prev === 'standard' ? 'satellite' : 'standard'));
+  }, []);
+
+  const handleOpenAI = useCallback(() => setIsAIChatVisible(true), []);
+  const handleCloseAI = useCallback(() => setIsAIChatVisible(false), []);
+
+  // ---- Sheet header animated style (fade + translate on expand) ----
+  const sheetHeaderStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      animatedIndex.value,
+      [0, 1],
+      [1, 0.3],
+      Extrapolation.CLAMP,
+    );
+    return { opacity };
+  });
 
   return (
     <GestureHandlerRootView style={styles.root}>
-      {/* Full-screen map underneath */}
+      {/* Background: pure map (absoluteFill, sibling) */}
       <MapContainer />
+
+      {/* Absolute overlay: HUD + Orb + Floating buttons (siblings of map) */}
+      {isRecording && (
+        <StatsHUD
+          elapsedSeconds={elapsedSeconds}
+          totalDistance={totalDistance}
+          elevationGain={elevationGain}
+        />
+      )}
+
+      {isRecording && <PEIOrb />}
+
+      <FloatingButtons
+        activeSource={activeSource}
+        onSwitchSource={handleSwitchSource}
+        onOpenAI={handleOpenAI}
+      />
 
       {/* Bottom Sheet Drawer */}
       <BottomSheet
@@ -154,38 +225,39 @@ export default function HikeGoScreen() {
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
         >
-          {/* ---- PEI Safety Bar (always visible at collapsed 16%) ---- */}
-          <View style={styles.peiBar}>
-            <View style={styles.peiRow}>
-              <View style={[styles.peiDot, { backgroundColor: peiColor }]} />
-              <Text style={styles.peiLabelText}>PEI</Text>
-              <Text style={[styles.peiValue, { color: peiColor }]}>{peiResult.value}</Text>
-              <Text style={[styles.peiLevel, { color: peiColor }]}>{peiLabel}</Text>
-            </View>
+          {/* PEI Safety Bar (always visible at collapsed 16%) */}
+          <Animated.View style={sheetHeaderStyle}>
+            <View style={styles.peiBar}>
+              <View style={styles.peiRow}>
+                <View style={[styles.peiDot, { backgroundColor: peiColor }]} />
+                <Text style={styles.peiLabelText}>PEI</Text>
+                <Text style={[styles.peiValue, { color: peiColor }]}>{peiResult.value}</Text>
+                <Text style={[styles.peiLevel, { color: peiColor }]}>{peiLabel}</Text>
+              </View>
 
-            {/* Compact stats row */}
-            <View style={styles.statsRow}>
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{formatTime(elapsedSeconds)}</Text>
-                <Text style={styles.statLabel}>用时</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{formatDistance(totalDistance)}</Text>
-                <Text style={styles.statLabel}>距离</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{Math.round(elevationGain)}m</Text>
-                <Text style={styles.statLabel}>爬升</Text>
+              <View style={styles.statsRow}>
+                <View style={styles.statItem}>
+                  <Text style={styles.statValue}>{formatTime(elapsedSeconds)}</Text>
+                  <Text style={styles.statLabel}>用时</Text>
+                </View>
+                <View style={styles.statDivider} />
+                <View style={styles.statItem}>
+                  <Text style={styles.statValue}>{formatDistance(totalDistance)}</Text>
+                  <Text style={styles.statLabel}>距离</Text>
+                </View>
+                <View style={styles.statDivider} />
+                <View style={styles.statItem}>
+                  <Text style={styles.statValue}>{Math.round(elevationGain)}m</Text>
+                  <Text style={styles.statLabel}>爬升</Text>
+                </View>
               </View>
             </View>
-          </View>
+          </Animated.View>
 
-          {/* ---- Start / Stop Button ---- */}
+          {/* Start / Stop Button — THE ONLY stop button in the entire app */}
           <View style={styles.actionButtonWrapper}>
             {isRecording ? (
-              <TouchableOpacity activeOpacity={0.85} onPress={handleToggleHike}>
+              <TouchableOpacity activeOpacity={0.85} onPress={handleStopHike}>
                 <LinearGradient
                   colors={['#ff4d4f', '#cf1322']}
                   start={{ x: 0, y: 0 }}
@@ -196,7 +268,7 @@ export default function HikeGoScreen() {
                 </LinearGradient>
               </TouchableOpacity>
             ) : (
-              <TouchableOpacity activeOpacity={0.85} onPress={handleToggleHike}>
+              <TouchableOpacity activeOpacity={0.85} onPress={handleStartHike}>
                 <LinearGradient
                   colors={['#10B981', '#059669']}
                   start={{ x: 0, y: 0 }}
@@ -209,7 +281,7 @@ export default function HikeGoScreen() {
             )}
           </View>
 
-          {/* ---- PEI Breakdown ---- */}
+          {/* PEI Breakdown */}
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>体能指数分解</Text>
             <View style={styles.peiBreakdownRow}>
@@ -232,26 +304,36 @@ export default function HikeGoScreen() {
             <Text style={styles.formula}>PEI = 0.50 x HR + 0.35 x SpO2 + 0.15 x Alt</Text>
           </View>
 
-          {/* ---- Real-time Biometrics Trend Chart ---- */}
+          {/* Real-time Biometrics Trend Chart */}
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>实时趋势</Text>
             <BiometricsChart data={biometricsHistory} />
           </View>
 
-          {/* ---- Biometrics Sliders (for simulation) ---- */}
+          {/* Biometrics Cards (simulation) */}
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>体征模拟</Text>
             <View style={styles.biometricsRow}>
               <View style={styles.biometricCard}>
                 <Text style={styles.biometricLabel}>心率</Text>
-                <Text style={[styles.biometricValue, { color: biometrics.currentHeartRate > 160 ? '#ff4d4f' : '#3B82F6' }]}>
+                <Text
+                  style={[
+                    styles.biometricValue,
+                    { color: biometrics.currentHeartRate > 160 ? '#ff4d4f' : '#3B82F6' },
+                  ]}
+                >
                   {biometrics.currentHeartRate}
                 </Text>
                 <Text style={styles.biometricUnit}>bpm</Text>
               </View>
               <View style={styles.biometricCard}>
                 <Text style={styles.biometricLabel}>血氧</Text>
-                <Text style={[styles.biometricValue, { color: biometrics.spo2 < 90 ? '#ff4d4f' : '#10B981' }]}>
+                <Text
+                  style={[
+                    styles.biometricValue,
+                    { color: biometrics.spo2 < 90 ? '#ff4d4f' : '#10B981' },
+                  ]}
+                >
                   {biometrics.spo2}
                 </Text>
                 <Text style={styles.biometricUnit}>%</Text>
@@ -259,10 +341,22 @@ export default function HikeGoScreen() {
             </View>
           </View>
 
-          {/* Bottom padding for safe area */}
           <View style={{ height: 40 }} />
         </BottomSheetScrollView>
       </BottomSheet>
+
+      {/* SafetyAlert modal */}
+      <SafetyAlert />
+
+      {/* AI Chat fullscreen modal */}
+      <Modal
+        visible={isAIChatVisible}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={handleCloseAI}
+      >
+        <AIChatScreen visible={isAIChatVisible} onClose={handleCloseAI} />
+      </Modal>
     </GestureHandlerRootView>
   );
 }
