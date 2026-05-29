@@ -12,6 +12,8 @@
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "SmartHike 需要访问您的位置以在地图上显示您的当前位置和徒步轨迹。",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "SmartHike 需要在后台持续获取您的位置以记录徒步轨迹。",
+        "NSHealthShareUsageDescription": "SmartHike 需要读取您的实时心率和血氧数据以评估体能状态并发出高风险预警。",
+        "NSHealthUpdateUsageDescription": "SmartHike 需要写入健康数据以记录您的徒步体能状态。",
         "UIBackgroundModes": [
           "location"
         ],
@@ -57,7 +59,17 @@
           "isIosBackgroundLocationEnabled": true
         }
       ],
-      "expo-task-manager"
+      "expo-task-manager",
+      "react-native-health",
+      "react-native-health-connect",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ]
     ],
     "extra": {
       "eas": {

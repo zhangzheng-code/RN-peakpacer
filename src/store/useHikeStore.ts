@@ -22,6 +22,7 @@ import type {
   UserProfile,
   BiometricsData,
   ChatMessage,
+  BiometricsRecord,
 } from '../types';
 
 /**
@@ -157,6 +158,17 @@ interface HikeStoreState {
 
   /** 设置 Tab 栏可见性 */
   setTabBarVisible: (visible: boolean) => void;
+
+  // ---- 体征历史（滑动窗口） ----
+
+  /** 最近 30 个数据点的体征历史 */
+  biometricsHistory: BiometricsRecord[];
+
+  /** 添加一条体征记录（FIFO 滑动窗口，超过 30 自动丢弃最旧） */
+  addBiometricsRecord: (record: BiometricsRecord) => void;
+
+  /** 清空体征历史 */
+  clearBiometricsHistory: () => void;
 }
 
 /**
@@ -220,6 +232,7 @@ export const useHikeStore = create<HikeStoreState>()(
       exploredGridSet: new Set<string>(),
       currentTab: 'HikeGo',
       isTabBarVisible: true,
+      biometricsHistory: [],
 
       // ---- Actions 实现 ----
 
@@ -372,6 +385,21 @@ export const useHikeStore = create<HikeStoreState>()(
 
       setTabBarVisible: (visible) => {
         set({ isTabBarVisible: visible });
+      },
+
+      addBiometricsRecord: (record) => {
+        set((prev) => {
+          const next = [...prev.biometricsHistory, record];
+          // FIFO sliding window: keep only the last 30 records
+          if (next.length > 30) {
+            return { biometricsHistory: next.slice(next.length - 30) };
+          }
+          return { biometricsHistory: next };
+        });
+      },
+
+      clearBiometricsHistory: () => {
+        set({ biometricsHistory: [] });
       },
     }),
     {

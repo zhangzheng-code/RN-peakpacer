@@ -14,8 +14,10 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapContainer from '../components/MapContainer';
+import BiometricsChart from '../components/BiometricsChart';
 import { useHikeStore } from '../store/useHikeStore';
 import { calculatePEI, getPEIColor, getPEILabel } from '../utils/healthCalculator';
+import { startHealthDataStream, stopHealthDataStream } from '../services/healthService';
 
 export default function HikeGoScreen() {
   const insets = useSafeAreaInsets();
@@ -33,8 +35,43 @@ export default function HikeGoScreen() {
   const setTabBarVisible = useHikeStore((s) => s.setTabBarVisible);
   const startHike = useHikeStore((s) => s.startHike);
   const stopHike = useHikeStore((s) => s.stopHike);
+  const updateBiometrics = useHikeStore((s) => s.updateBiometrics);
+  const addBiometricsRecord = useHikeStore((s) => s.addBiometricsRecord);
+  const biometricsHistory = useHikeStore((s) => s.biometricsHistory);
+  const clearBiometricsHistory = useHikeStore((s) => s.clearBiometricsHistory);
 
   const isRecording = hikeStatus === 'recording';
+
+  // ---- Health data stream lifecycle ----
+  useEffect(() => {
+    if (!isRecording) {
+      stopHealthDataStream();
+      return;
+    }
+
+    clearBiometricsHistory();
+
+    startHealthDataStream((data) => {
+      updateBiometrics({ currentHeartRate: data.heartRate, spo2: data.spO2 });
+
+      const peiResult = calculatePEI(
+        useHikeStore.getState().profile,
+        { currentHeartRate: data.heartRate, spo2: data.spO2 },
+        useHikeStore.getState().elevationGain,
+        0.3,
+      );
+
+      addBiometricsRecord({
+        timestamp: Date.now(),
+        heartRate: data.heartRate,
+        pei: peiResult.value,
+      });
+    });
+
+    return () => {
+      stopHealthDataStream();
+    };
+  }, [isRecording, updateBiometrics, addBiometricsRecord, clearBiometricsHistory]);
 
   // ---- PEI computation ----
   const peiResult = useMemo(
@@ -195,17 +232,10 @@ export default function HikeGoScreen() {
             <Text style={styles.formula}>PEI = 0.50 x HR + 0.35 x SpO2 + 0.15 x Alt</Text>
           </View>
 
-          {/* ---- Trend Chart Placeholder ---- */}
+          {/* ---- Real-time Biometrics Trend Chart ---- */}
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>趋势图</Text>
-            <View style={styles.chartPlaceholder}>
-              {/* SVG trend chart placeholder */}
-              <View style={styles.chartPlaceholderInner}>
-                <Text style={styles.chartPlaceholderIcon}>📈</Text>
-                <Text style={styles.chartPlaceholderText}>心率 / PEI 趋势图</Text>
-                <Text style={styles.chartPlaceholderSubtext}>数据积累后自动绘制</Text>
-              </View>
-            </View>
+            <Text style={styles.sectionTitle}>实时趋势</Text>
+            <BiometricsChart data={biometricsHistory} />
           </View>
 
           {/* ---- Biometrics Sliders (for simulation) ---- */}
@@ -382,34 +412,6 @@ const styles = StyleSheet.create({
     color: '#4B5563',
     textAlign: 'center',
     fontVariant: ['tabular-nums'],
-  },
-  // ---- Chart Placeholder ----
-  chartPlaceholder: {
-    height: 160,
-    borderRadius: 12,
-    backgroundColor: 'rgba(16,185,129,0.04)',
-    borderWidth: 1,
-    borderColor: 'rgba(16,185,129,0.1)',
-    overflow: 'hidden',
-  },
-  chartPlaceholderInner: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chartPlaceholderIcon: {
-    fontSize: 36,
-    marginBottom: 8,
-  },
-  chartPlaceholderText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: 'rgba(16,185,129,0.5)',
-  },
-  chartPlaceholderSubtext: {
-    fontSize: 11,
-    color: '#4B5563',
-    marginTop: 4,
   },
   // ---- Biometrics ----
   biometricsRow: {

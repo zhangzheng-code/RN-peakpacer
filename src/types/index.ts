@@ -97,6 +97,18 @@ export interface PEIResult {
 }
 
 /**
+ * 生理体征历史记录（滑动窗口数据点）
+ */
+export interface BiometricsRecord {
+  /** 时间戳（Unix 毫秒） */
+  timestamp: number;
+  /** 心率（bpm） */
+  heartRate: number;
+  /** 生理耗竭指数 */
+  pei: number;
+}
+
+/**
  * AI 聊天消息
  */
 export interface ChatMessage {
