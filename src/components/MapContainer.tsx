@@ -1,15 +1,15 @@
 /**
  * ============================================================
- * MapContainer — WebView + Leaflet.js（视口坍塌修复版）
+ * MapContainer — WebView + Leaflet.js（单点视口坍塌修复版）
  * ============================================================
  *
  * 修复要点：
- * 1. HTML/CSS 全部 absolute 撑满，消除 Leaflet 视口坍塌
- * 2. invalidateSize 延迟注入 + resize 监听，确保视口同步
- * 3. HTML 为完全静态常量，无动态变量，杜绝 WebView 重载
- * 4. WebView 固定 key + absoluteFillObject，防止 React 重绘卸载
- * 5. injectJavaScript 使用 JSON.stringify 安全注入，杜绝转义崩溃
- * 6. drawTrack 使用 setLatLngs 原地更新，不重建 polyline
+ * 1. drawTrack 单点降级：1 个点 → setView(lat, 16)，绝不 fitBounds
+ * 2. drawTrack 多点兜底：fitBounds + maxZoom:16 + padding
+ * 3. setUserLocation / flyTo 全部使用 setView，不用 fitBounds
+ * 4. 保留 invalidateSize 延迟注入 + resize 监听
+ * 5. 静态 HTML 常量 + 固定 key + absoluteFillObject
+ * 6. injectCall 使用 JSON.stringify 安全序列化
  */
 
 import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
@@ -86,7 +86,7 @@ const LEAFLET_HTML = `<!DOCTYPE html>
   <div id="map"></div>
   <script>
     (function() {
-      // ---- Initialize map with absolute-fill CSS ----
+      // ---- Initialize map ----
       var map = L.map('map', {
         center: [${INITIAL_LAT}, ${INITIAL_LNG}],
         zoom: ${INITIAL_ZOOM},
@@ -127,17 +127,9 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       var userCircle = null;
 
       // ---- 核心修复：延迟 invalidateSize 确保视口同步 ----
-      setTimeout(function() {
-        map.invalidateSize({ animate: false });
-      }, 100);
-
-      setTimeout(function() {
-        map.invalidateSize({ animate: false });
-      }, 300);
-
-      setTimeout(function() {
-        map.invalidateSize({ animate: false });
-      }, 800);
+      setTimeout(function() { map.invalidateSize({ animate: false }); }, 100);
+      setTimeout(function() { map.invalidateSize({ animate: false }); }, 300);
+      setTimeout(function() { map.invalidateSize({ animate: false }); }, 800);
 
       // ---- 监听窗口尺寸变化，动态刷新 ----
       window.addEventListener('resize', function() {
@@ -152,12 +144,38 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       // ================================================================
 
       /**
-       * 绘制/更新轨迹线（原地 setLatLngs，不重建 polyline）
+       * 绘制/更新轨迹线
+       *
+       * 核心修复：
+       * - points.length === 1 → setView（单点降级，绝不 fitBounds）
+       * - points.length >= 2 → setLatLngs + fitBounds（maxZoom 兜底）
+       * - points.length === 0 → 不做任何操作
        */
       window.drawTrack = function(pointsJson) {
         try {
           var points = JSON.parse(pointsJson);
-          if (!points || points.length < 2) return;
+          if (!points || points.length === 0) return;
+
+          if (points.length === 1) {
+            // ---- 单点降级：setView，保持高清缩放 ----
+            var pt = points[0];
+            if (trailPolyline) {
+              trailPolyline.setLatLngs([pt]);
+            } else {
+              trailPolyline = L.polyline([pt], {
+                color: '${TRAIL_COLOR}',
+                weight: ${TRAIL_WEIGHT},
+                lineCap: 'round',
+                lineJoin: 'round',
+                smoothFactor: 1,
+              }).addTo(map);
+            }
+            // 绝不 fitBounds 单点！使用 setView 保持稳定缩放
+            map.setView(pt, 16, { animate: true, duration: 0.5 });
+            return;
+          }
+
+          // ---- 多点：原地更新 + fitBounds 兜底 ----
           if (trailPolyline) {
             trailPolyline.setLatLngs(points);
           } else {
@@ -168,6 +186,17 @@ const LEAFLET_HTML = `<!DOCTYPE html>
               lineJoin: 'round',
               smoothFactor: 1,
             }).addTo(map);
+          }
+
+          // fitBounds 兜底：maxZoom:16 防止过度缩放
+          var bounds = L.latLngBounds(points);
+          if (bounds.isValid()) {
+            map.fitBounds(bounds, {
+              maxZoom: 16,
+              padding: [40, 40],
+              animate: true,
+              duration: 0.5,
+            });
           }
         } catch (e) {
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'drawTrack: ' + e.message }));
@@ -197,7 +226,6 @@ const LEAFLET_HTML = `<!DOCTYPE html>
               gridRectangles[g.key] = rect;
             }
           }
-          // Remove stale grids
           for (var oldKey in gridRectangles) {
             if (!newKeys[oldKey]) {
               map.removeLayer(gridRectangles[oldKey]);
@@ -223,22 +251,29 @@ const LEAFLET_HTML = `<!DOCTYPE html>
             standardTile.addTo(map);
             currentTileType = 'standard';
           }
-        } catch (e) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'setTileSource: ' + e.message }));
-        }
-      };
-
-      /**
-       * 飞行到指定坐标
-       */
-      window.flyTo = function(lat, lng, zoom) {
-        try {
-          map.flyTo([lat, lng], zoom || ${INITIAL_ZOOM}, { duration: 0.8 });
         } catch (e) {}
       };
 
       /**
-       * 设置/更新用户位置标记
+       * 设置地图中心（单点定位专用，绝不 fitBounds）
+       */
+      window.setView = function(lat, lng, zoom) {
+        try {
+          map.setView([lat, lng], zoom || 16, { animate: true, duration: 0.5 });
+        } catch (e) {}
+      };
+
+      /**
+       * 飞行到指定坐标（封装 setView，兼容旧调用）
+       */
+      window.flyTo = function(lat, lng, zoom) {
+        try {
+          map.setView([lat, lng], zoom || 16, { animate: true, duration: 0.5 });
+        } catch (e) {}
+      };
+
+      /**
+       * 设置/更新用户位置标记（使用 setView，不用 fitBounds）
        */
       window.setUserLocation = function(lat, lng) {
         try {
@@ -266,11 +301,13 @@ const LEAFLET_HTML = `<!DOCTYPE html>
               opacity: 0.4,
             }).addTo(map);
           }
+          // 单点定位：setView，绝不 fitBounds
+          map.setView(latlng, 16, { animate: true, duration: 0.5 });
         } catch (e) {}
       };
 
       /**
-       * 强制刷新视口（RN 端在布局变化后调用）
+       * 强制刷新视口
        */
       window.refreshView = function() {
         map.invalidateSize({ animate: false });
@@ -293,9 +330,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 }
 
 // ---- Safe inject helper ----
-// 使用 JSON.stringify 序列化数据，杜绝手动字符串转义的转义崩溃
 
-function injectCall(webViewRef: React.RefObject<WebView | null>, fnName: string, ...args: unknown[]) {
+function injectCall(
+  webViewRef: React.RefObject<WebView | null>,
+  fnName: string,
+  ...args: unknown[]
+) {
   const safeArgs = args.map((a) => JSON.stringify(a)).join(',');
   const js = `try { ${fnName}(${safeArgs}); } catch(e) {} void(0);`;
   webViewRef.current?.injectJavaScript(js);
@@ -360,19 +400,19 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           break;
       }
     } catch {
-      // ignore parse errors
+      // ignore
     }
   }, []);
 
-  // ---- Sync trail polyline to WebView (原地更新，不重建) ----
+  // ---- Sync trail to WebView ----
   useEffect(() => {
-    if (!mapReady) return;
-    if (displayPoints.length < 2) return;
+    if (!mapReady || displayPoints.length === 0) return;
 
     const coords: Array<[number, number]> = displayPoints.map((p) => [
       p.latitude,
       p.longitude,
     ]);
+    // drawTrack 内部处理单点 vs 多点逻辑
     injectCall(webViewRef, 'window.drawTrack', JSON.stringify(coords));
   }, [displayPoints, mapReady]);
 
@@ -409,7 +449,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       setUserLocation(DEBUG_DEFAULT_LOCATION);
       dismissLoadingOverlay();
       if (mapReady) {
-        injectCall(webViewRef, 'window.flyTo', DEBUG_DEFAULT_LOCATION.latitude, DEBUG_DEFAULT_LOCATION.longitude, 15);
+        injectCall(webViewRef, 'window.setView', DEBUG_DEFAULT_LOCATION.latitude, DEBUG_DEFAULT_LOCATION.longitude, 15);
       }
     }
     lastTapRef.current = now;
@@ -473,14 +513,13 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     return () => { cancelled = true; };
   }, [dismissLoadingOverlay]);
 
-  // ---- Send user location to map when known ----
+  // ---- Send user location to map when known (setView, not fitBounds) ----
   useEffect(() => {
     if (!mapReady || !userLocation) return;
     injectCall(webViewRef, 'window.setUserLocation', userLocation.latitude, userLocation.longitude);
-    injectCall(webViewRef, 'window.flyTo', userLocation.latitude, userLocation.longitude, 15);
   }, [userLocation, mapReady]);
 
-  // ---- Foreground polling: read trail buffer, update display + store ----
+  // ---- Foreground polling ----
   useEffect(() => {
     if (!isRecording) {
       if (pollTimerRef.current) {
@@ -525,19 +564,13 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     };
   }, [isRecording, currentPath.length, appendTrailPoints, setTotalDistance, setElevationGain, exploreGridsBatch]);
 
-  // ---- Cleanup on unmount ----
+  // ---- Cleanup ----
   useEffect(() => {
     return () => { isMountedRef.current = false; };
   }, []);
 
   return (
     <View style={styles.root}>
-      {/*
-        WebView Leaflet Map
-        - key 固定，防止 React 重绘树中被意外卸载重建
-        - source 为静态常量引用，永不变化
-        - style 为 absoluteFillObject，绝对撑满
-      */}
       <WebView
         key="smarthike-leaflet-map"
         ref={webViewRef}
@@ -555,7 +588,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         setSupportMultipleWindows={false}
       />
 
-      {/* GPS Loading Overlay — double-tap to bypass */}
+      {/* GPS Loading Overlay */}
       {!loadingDismissed && (
         <Animated.View
           style={[StyleSheet.absoluteFillObject, loadingAnimatedStyle, { zIndex: 50 }]}
