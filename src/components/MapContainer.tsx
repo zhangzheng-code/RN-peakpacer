@@ -618,6 +618,8 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
 const styles = StyleSheet.create({
   root: {
     ...StyleSheet.absoluteFillObject,
+    bottom: 80, // 留出 TabBar 高度空间，防止 WebView 原生层遮挡底栏
+    overflow: 'hidden',
     backgroundColor: '#121314',
   },
   loadingCenter: {

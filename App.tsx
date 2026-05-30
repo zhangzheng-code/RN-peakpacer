@@ -212,6 +212,7 @@ export default function App() {
           tabBar={(props) => <CustomCurvedTabBar {...props} />}
           screenOptions={{
             headerShown: false,
+            tabBarStyle: { display: 'flex' },
           }}
           sceneContainerStyle={{ backgroundColor: '#121314' }}
         >
