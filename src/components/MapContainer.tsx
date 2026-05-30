@@ -1,15 +1,19 @@
 /**
  * ============================================================
- * MapContainer — WebView + Leaflet.js 地图引擎
+ * MapContainer — WebView + Leaflet.js（视口坍塌修复版）
  * ============================================================
  *
- * 100% 免费、免配置、多端一致的高帧率地图方案。
- * 用 react-native-webview 渲染本地自闭环 HTML + Leaflet，
- * 通过 postMessage / injectJavaScript 双向桥接通信。
+ * 修复要点：
+ * 1. HTML/CSS 全部 absolute 撑满，消除 Leaflet 视口坍塌
+ * 2. invalidateSize 延迟注入 + resize 监听，确保视口同步
+ * 3. HTML 为完全静态常量，无动态变量，杜绝 WebView 重载
+ * 4. WebView 固定 key + absoluteFillObject，防止 React 重绘卸载
+ * 5. injectJavaScript 使用 JSON.stringify 安全注入，杜绝转义崩溃
+ * 6. drawTrack 使用 setLatLngs 原地更新，不重建 polyline
  */
 
 import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
-import { StyleSheet, View, Text, ActivityIndicator, Pressable, Alert, Dimensions, Platform } from 'react-native';
+import { StyleSheet, View, Text, ActivityIndicator, Pressable, Alert } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import Animated, {
   useSharedValue,
@@ -30,8 +34,10 @@ import type { UserLocation, TrailPoint, TileSourceType } from '../types';
 
 // ---- Constants ----
 
-const INITIAL_CENTER: UserLocation = { latitude: 34.2635, longitude: 108.948 };
+const INITIAL_LAT = 34.2635;
+const INITIAL_LNG = 108.948;
 const INITIAL_ZOOM = 13;
+const GRID_SIZE = 0.001;
 
 const AMAP_STANDARD_URL =
   'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}';
@@ -48,10 +54,11 @@ const TRAIL_WEIGHT = 5;
 const GRID_FILL_COLOR = 'rgba(16, 185, 129, 0.22)';
 const USER_MARKER_COLOR = '#3B82F6';
 
-// ---- Leaflet HTML Template ----
-
-function buildLeafletHTML(): string {
-  return `<!DOCTYPE html>
+/**
+ * 完全静态的 Leaflet HTML 模板。
+ * 不含任何动态变量，确保 WebView 永不因 source 变化而重载。
+ */
+const LEAFLET_HTML = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -59,176 +66,219 @@ function buildLeafletHTML(): string {
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body, #map { width: 100%; height: 100%; background: #121314; }
+    html, body, #map {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #121314;
+    }
     .leaflet-control-attribution { display: none !important; }
     .leaflet-control-zoom { display: none !important; }
+    .leaflet-tile-pane { opacity: 1; }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <script>
     (function() {
-      // ---- Initialize map ----
+      // ---- Initialize map with absolute-fill CSS ----
       var map = L.map('map', {
-        center: [${INITIAL_CENTER.latitude}, ${INITIAL_CENTER.longitude}],
+        center: [${INITIAL_LAT}, ${INITIAL_LNG}],
         zoom: ${INITIAL_ZOOM},
         zoomControl: false,
         attributionControl: false,
         preferCanvas: true,
+        trackResize: true,
+        zoomAnimation: true,
+        markerZoomAnimation: false,
       });
 
       // ---- Tile layers ----
       var standardTile = L.tileLayer('${AMAP_STANDARD_URL}', {
         maxZoom: 18,
         tileSize: 256,
+        updateWhenIdle: true,
+        updateWhenZooming: false,
       });
 
       var satelliteTile = L.tileLayer('${AMAP_SATELLITE_URL}', {
         maxZoom: 18,
         tileSize: 256,
+        updateWhenIdle: true,
+        updateWhenZooming: false,
       });
 
       standardTile.addTo(map);
       var currentTileType = 'standard';
 
-      // ---- Trail polyline ----
-      var trailLayer = L.layerGroup().addTo(map);
+      // ---- Trail polyline (created once, updated in-place) ----
       var trailPolyline = null;
 
       // ---- Exploration grids ----
-      var gridLayer = L.layerGroup().addTo(map);
       var gridRectangles = {};
 
       // ---- User location marker ----
       var userMarker = null;
       var userCircle = null;
 
-      // ---- Helpers ----
-      function sendMessage(type, data) {
-        window.ReactNativeWebView.postMessage(JSON.stringify({ type: type, data: data }));
-      }
+      // ---- 核心修复：延迟 invalidateSize 确保视口同步 ----
+      setTimeout(function() {
+        map.invalidateSize({ animate: false });
+      }, 100);
 
-      // ---- Message handler ----
-      window.handleRNMessage = function(msg) {
+      setTimeout(function() {
+        map.invalidateSize({ animate: false });
+      }, 300);
+
+      setTimeout(function() {
+        map.invalidateSize({ animate: false });
+      }, 800);
+
+      // ---- 监听窗口尺寸变化，动态刷新 ----
+      window.addEventListener('resize', function() {
+        map.invalidateSize({ animate: false });
+      });
+
+      // ---- 通知 RN 端 map 已就绪 ----
+      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'mapReady' }));
+
+      // ================================================================
+      // 全局 API：RN 端通过 injectJavaScript 调用以下函数
+      // ================================================================
+
+      /**
+       * 绘制/更新轨迹线（原地 setLatLngs，不重建 polyline）
+       */
+      window.drawTrack = function(pointsJson) {
         try {
-          var cmd = JSON.parse(msg);
-
-          switch (cmd.type) {
-            case 'updateTrail':
-              if (trailPolyline) {
-                trailLayer.removeLayer(trailPolyline);
-              }
-              if (cmd.coords && cmd.coords.length >= 2) {
-                trailPolyline = L.polyline(cmd.coords, {
-                  color: '${TRAIL_COLOR}',
-                  weight: ${TRAIL_WEIGHT},
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                  smoothFactor: 1,
-                });
-                trailLayer.addLayer(trailPolyline);
-              }
-              break;
-
-            case 'updateGrids':
-              // Remove old grids not in new set
-              var newKeys = {};
-              if (cmd.keys) {
-                for (var i = 0; i < cmd.keys.length; i++) {
-                  newKeys[cmd.keys[i]] = true;
-                }
-              }
-              // Remove stale
-              for (var oldKey in gridRectangles) {
-                if (!newKeys[oldKey]) {
-                  gridLayer.removeLayer(gridRectangles[oldKey]);
-                  delete gridRectangles[oldKey];
-                }
-              }
-              // Add new
-              if (cmd.grids) {
-                for (var j = 0; j < cmd.grids.length; j++) {
-                  var g = cmd.grids[j];
-                  if (!gridRectangles[g.key]) {
-                    var rect = L.rectangle(
-                      [[g.south, g.west], [g.north, g.east]],
-                      {
-                        fillColor: '${GRID_FILL_COLOR}',
-                        fillOpacity: 1,
-                        stroke: false,
-                        interactive: false,
-                      }
-                    );
-                    gridLayer.addLayer(rect);
-                    gridRectangles[g.key] = rect;
-                  }
-                }
-              }
-              break;
-
-            case 'setTileSource':
-              if (cmd.source === 'satellite' && currentTileType !== 'satellite') {
-                map.removeLayer(standardTile);
-                satelliteTile.addTo(map);
-                currentTileType = 'satellite';
-              } else if (cmd.source === 'standard' && currentTileType !== 'standard') {
-                map.removeLayer(satelliteTile);
-                standardTile.addTo(map);
-                currentTileType = 'standard';
-              }
-              break;
-
-            case 'flyTo':
-              map.flyTo([cmd.lat, cmd.lng], cmd.zoom || ${INITIAL_ZOOM}, { duration: 0.8 });
-              break;
-
-            case 'setUserLocation':
-              var latlng = [cmd.lat, cmd.lng];
-              if (userMarker) {
-                userMarker.setLatLng(latlng);
-              } else {
-                userMarker = L.circleMarker(latlng, {
-                  radius: 8,
-                  fillColor: '${USER_MARKER_COLOR}',
-                  fillOpacity: 0.9,
-                  color: '#ffffff',
-                  weight: 2,
-                }).addTo(map);
-              }
-              if (userCircle) {
-                userCircle.setLatLng(latlng);
-              } else {
-                userCircle = L.circleMarker(latlng, {
-                  radius: 20,
-                  fillColor: '${USER_MARKER_COLOR}',
-                  fillOpacity: 0.12,
-                  color: '${USER_MARKER_COLOR}',
-                  weight: 1,
-                  opacity: 0.4,
-                }).addTo(map);
-              }
-              break;
-
-            case 'centerOnUser':
-              if (userMarker) {
-                var pos = userMarker.getLatLng();
-                map.flyTo(pos, cmd.zoom || 15, { duration: 0.5 });
-              }
-              break;
+          var points = JSON.parse(pointsJson);
+          if (!points || points.length < 2) return;
+          if (trailPolyline) {
+            trailPolyline.setLatLngs(points);
+          } else {
+            trailPolyline = L.polyline(points, {
+              color: '${TRAIL_COLOR}',
+              weight: ${TRAIL_WEIGHT},
+              lineCap: 'round',
+              lineJoin: 'round',
+              smoothFactor: 1,
+            }).addTo(map);
           }
         } catch (e) {
-          sendMessage('error', e.message);
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'drawTrack: ' + e.message }));
         }
       };
 
-      // ---- Notify RN that map is ready ----
-      sendMessage('mapReady', {});
+      /**
+       * 更新探索网格
+       */
+      window.updateGrids = function(gridsJson) {
+        try {
+          var grids = JSON.parse(gridsJson);
+          var newKeys = {};
+          for (var i = 0; i < grids.length; i++) {
+            var g = grids[i];
+            newKeys[g.key] = true;
+            if (!gridRectangles[g.key]) {
+              var rect = L.rectangle(
+                [[g.south, g.west], [g.north, g.east]],
+                {
+                  fillColor: '${GRID_FILL_COLOR}',
+                  fillOpacity: 1,
+                  stroke: false,
+                  interactive: false,
+                }
+              ).addTo(map);
+              gridRectangles[g.key] = rect;
+            }
+          }
+          // Remove stale grids
+          for (var oldKey in gridRectangles) {
+            if (!newKeys[oldKey]) {
+              map.removeLayer(gridRectangles[oldKey]);
+              delete gridRectangles[oldKey];
+            }
+          }
+        } catch (e) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'updateGrids: ' + e.message }));
+        }
+      };
+
+      /**
+       * 切换底图图源
+       */
+      window.setTileSource = function(source) {
+        try {
+          if (source === 'satellite' && currentTileType !== 'satellite') {
+            map.removeLayer(standardTile);
+            satelliteTile.addTo(map);
+            currentTileType = 'satellite';
+          } else if (source === 'standard' && currentTileType !== 'standard') {
+            map.removeLayer(satelliteTile);
+            standardTile.addTo(map);
+            currentTileType = 'standard';
+          }
+        } catch (e) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'setTileSource: ' + e.message }));
+        }
+      };
+
+      /**
+       * 飞行到指定坐标
+       */
+      window.flyTo = function(lat, lng, zoom) {
+        try {
+          map.flyTo([lat, lng], zoom || ${INITIAL_ZOOM}, { duration: 0.8 });
+        } catch (e) {}
+      };
+
+      /**
+       * 设置/更新用户位置标记
+       */
+      window.setUserLocation = function(lat, lng) {
+        try {
+          var latlng = [lat, lng];
+          if (userMarker) {
+            userMarker.setLatLng(latlng);
+          } else {
+            userMarker = L.circleMarker(latlng, {
+              radius: 8,
+              fillColor: '${USER_MARKER_COLOR}',
+              fillOpacity: 0.9,
+              color: '#ffffff',
+              weight: 2,
+            }).addTo(map);
+          }
+          if (userCircle) {
+            userCircle.setLatLng(latlng);
+          } else {
+            userCircle = L.circleMarker(latlng, {
+              radius: 20,
+              fillColor: '${USER_MARKER_COLOR}',
+              fillOpacity: 0.12,
+              color: '${USER_MARKER_COLOR}',
+              weight: 1,
+              opacity: 0.4,
+            }).addTo(map);
+          }
+        } catch (e) {}
+      };
+
+      /**
+       * 强制刷新视口（RN 端在布局变化后调用）
+       */
+      window.refreshView = function() {
+        map.invalidateSize({ animate: false });
+      };
     })();
   <\/script>
 </body>
 </html>`;
-}
 
 // ---- Timeout helper ----
 
@@ -240,6 +290,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
       (err) => { clearTimeout(timer); reject(err); },
     );
   });
+}
+
+// ---- Safe inject helper ----
+// 使用 JSON.stringify 序列化数据，杜绝手动字符串转义的转义崩溃
+
+function injectCall(webViewRef: React.RefObject<WebView | null>, fnName: string, ...args: unknown[]) {
+  const safeArgs = args.map((a) => JSON.stringify(a)).join(',');
+  const js = `try { ${fnName}(${safeArgs}); } catch(e) {} void(0);`;
+  webViewRef.current?.injectJavaScript(js);
 }
 
 // ---- Props ----
@@ -264,12 +323,10 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   const [displayPoints, setDisplayPoints] = useState<TrailPoint[]>([]);
   const [loadingDismissed, setLoadingDismissed] = useState(false);
   const [mapReady, setMapReady] = useState(false);
-  const [screenDimensions, setScreenDimensions] = useState(Dimensions.get('window'));
 
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const webViewRef = useRef<WebView>(null);
   const isMountedRef = useRef(true);
-  const trailCoordsRef = useRef<Array<[number, number]>>([]);
 
   const loadingOpacity = useSharedValue(1);
 
@@ -287,19 +344,6 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   }, [loadingOpacity]);
 
   const isRecording = hikeStatus === 'recording';
-
-  // ---- Inject JS helper ----
-  const injectJS = useCallback((js: string) => {
-    if (webViewRef.current) {
-      webViewRef.current.injectJavaScript(js);
-    }
-  }, []);
-
-  // ---- Send message to WebView ----
-  const sendToMap = useCallback((type: string, data: Record<string, unknown>) => {
-    const payload = JSON.stringify({ type, ...data });
-    injectJS(`window.handleRNMessage('${payload.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}');`);
-  }, [injectJS]);
 
   // ---- Handle messages from WebView ----
   const handleWebViewMessage = useCallback((event: WebViewMessageEvent) => {
@@ -320,26 +364,22 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     }
   }, []);
 
-  // ---- Sync trail polyline to WebView ----
+  // ---- Sync trail polyline to WebView (原地更新，不重建) ----
   useEffect(() => {
     if (!mapReady) return;
+    if (displayPoints.length < 2) return;
 
     const coords: Array<[number, number]> = displayPoints.map((p) => [
       p.latitude,
       p.longitude,
     ]);
-    trailCoordsRef.current = coords;
-
-    if (coords.length >= 2) {
-      sendToMap('updateTrail', { coords });
-    }
-  }, [displayPoints, mapReady, sendToMap]);
+    injectCall(webViewRef, 'window.drawTrack', JSON.stringify(coords));
+  }, [displayPoints, mapReady]);
 
   // ---- Sync exploration grids to WebView ----
   useEffect(() => {
     if (!mapReady) return;
 
-    const GRID_SIZE = 0.001;
     const grids = exploredGrids.map((key) => {
       const parts = key.split(',');
       const latIndex = parseInt(parts[0], 10);
@@ -351,14 +391,14 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       return { key, south, north, west, east };
     });
 
-    sendToMap('updateGrids', { grids, keys: exploredGrids });
-  }, [exploredGrids, mapReady, sendToMap]);
+    injectCall(webViewRef, 'window.updateGrids', JSON.stringify(grids));
+  }, [exploredGrids, mapReady]);
 
   // ---- Sync tile source to WebView ----
   useEffect(() => {
     if (!mapReady) return;
-    sendToMap('setTileSource', { source: tileSource });
-  }, [tileSource, mapReady, sendToMap]);
+    injectCall(webViewRef, 'window.setTileSource', tileSource);
+  }, [tileSource, mapReady]);
 
   // ---- Debug bypass: double-tap loading overlay ----
   const lastTapRef = useRef(0);
@@ -369,11 +409,11 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       setUserLocation(DEBUG_DEFAULT_LOCATION);
       dismissLoadingOverlay();
       if (mapReady) {
-        sendToMap('flyTo', { lat: DEBUG_DEFAULT_LOCATION.latitude, lng: DEBUG_DEFAULT_LOCATION.longitude });
+        injectCall(webViewRef, 'window.flyTo', DEBUG_DEFAULT_LOCATION.latitude, DEBUG_DEFAULT_LOCATION.longitude, 15);
       }
     }
     lastTapRef.current = now;
-  }, [dismissLoadingOverlay, mapReady, sendToMap]);
+  }, [dismissLoadingOverlay, mapReady]);
 
   // ---- Location permission with timeout & fallback ----
   useEffect(() => {
@@ -436,9 +476,9 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   // ---- Send user location to map when known ----
   useEffect(() => {
     if (!mapReady || !userLocation) return;
-    sendToMap('setUserLocation', { lat: userLocation.latitude, lng: userLocation.longitude });
-    sendToMap('flyTo', { lat: userLocation.latitude, lng: userLocation.longitude, zoom: 15 });
-  }, [userLocation, mapReady, sendToMap]);
+    injectCall(webViewRef, 'window.setUserLocation', userLocation.latitude, userLocation.longitude);
+    injectCall(webViewRef, 'window.flyTo', userLocation.latitude, userLocation.longitude, 15);
+  }, [userLocation, mapReady]);
 
   // ---- Foreground polling: read trail buffer, update display + store ----
   useEffect(() => {
@@ -485,46 +525,25 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     };
   }, [isRecording, currentPath.length, appendTrailPoints, setTotalDistance, setElevationGain, exploreGridsBatch]);
 
-  // ---- HTML source (memoized, never changes) ----
-  const htmlSource = useRef({ html: buildLeafletHTML() }).current;
-
-  // ---- Dimension change listener ----
+  // ---- Cleanup on unmount ----
   useEffect(() => {
-    const subscription = Dimensions.addEventListener('change', ({ window }) => {
-      if (isMountedRef.current) {
-        setScreenDimensions(window);
-      }
-    });
-    return () => {
-      subscription?.remove();
-      isMountedRef.current = false;
-    };
+    return () => { isMountedRef.current = false; };
   }, []);
-
-  // ---- WebView lifecycle handlers ----
-  const handleWebViewLoadStart = useCallback(() => {
-    // WebView started loading — reset mapReady so effects wait for re-initialization
-    if (isMountedRef.current) {
-      setMapReady(false);
-    }
-  }, []);
-
-  const handleWebViewLoad = useCallback(() => {
-    // WebView finished loading — mapReady will be set via 'mapReady' message from JS
-  }, []);
-
-  const { width: SCREEN_W, height: SCREEN_H } = screenDimensions;
 
   return (
     <View style={styles.root}>
-      {/* WebView Leaflet Map — explicit dimensions prevent collapse on re-render */}
+      {/*
+        WebView Leaflet Map
+        - key 固定，防止 React 重绘树中被意外卸载重建
+        - source 为静态常量引用，永不变化
+        - style 为 absoluteFillObject，绝对撑满
+      */}
       <WebView
+        key="smarthike-leaflet-map"
         ref={webViewRef}
-        source={htmlSource}
-        style={{ width: SCREEN_W, height: SCREEN_H }}
+        source={{ html: LEAFLET_HTML }}
+        style={StyleSheet.absoluteFillObject}
         onMessage={handleWebViewMessage}
-        onLoadStart={handleWebViewLoadStart}
-        onLoadEnd={handleWebViewLoad}
         javaScriptEnabled
         domStorageEnabled
         allowsInlineMediaPlayback
@@ -534,7 +553,6 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         overScrollMode="never"
         originWhitelist={['*']}
         setSupportMultipleWindows={false}
-        androidLayerType="hardware"
       />
 
       {/* GPS Loading Overlay — double-tap to bypass */}
@@ -566,13 +584,8 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
 
 const styles = StyleSheet.create({
   root: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+    ...StyleSheet.absoluteFillObject,
     backgroundColor: '#121314',
-    zIndex: 0,
   },
   loadingCenter: {
     flex: 1,
