@@ -169,6 +169,11 @@ interface HikeStoreState {
 
   /** 清空体征历史 */
   clearBiometricsHistory: () => void;
+
+  // ---- GPX 路线导入 ----
+
+  /** 一键导入外部轨迹路线，覆盖 currentPath 并切换到录制状态 */
+  importRoutePath: (path: Array<{ latitude: number; longitude: number }>) => void;
 }
 
 /**
@@ -400,6 +405,21 @@ export const useHikeStore = create<HikeStoreState>()(
 
       clearBiometricsHistory: () => {
         set({ biometricsHistory: [] });
+      },
+
+      importRoutePath: (path) => {
+        const trailPoints: TrailPoint[] = path.map((p) => ({
+          latitude: p.latitude,
+          longitude: p.longitude,
+          timestamp: Date.now(),
+        }));
+        set({
+          currentPath: trailPoints,
+          hikeStatus: 'recording',
+          startTime: Date.now(),
+          totalDistance: 0,
+          elevationGain: 0,
+        });
       },
     }),
     {
