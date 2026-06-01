@@ -30,6 +30,7 @@ import {
   getTotalDistance,
 } from '../tasks/backgroundLocationTask';
 import { useHikeStore } from '../store/useHikeStore';
+import { useShallow } from 'zustand/shallow';
 import type { UserLocation, TrailPoint, TileSourceType } from '../types';
 
 // ---- Constants ----
@@ -119,8 +120,62 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       // ---- Trail polyline (created once, updated in-place) ----
       var trailPolyline = null;
 
-      // ---- Exploration grids ----
-      var gridRectangles = {};
+      // ---- Fog-of-war canvas overlay ----
+      var fogCanvas = null;
+      var fogCtx = null;
+      var exploredGridKeys = {};
+
+      var FogOverlay = L.Layer.extend({
+        onAdd: function(map) {
+          fogCanvas = L.DomUtil.create('canvas', 'fog-overlay');
+          var pane = map.getPane('overlayPane');
+          pane.appendChild(fogCanvas);
+          fogCtx = fogCanvas.getContext('2d');
+          this._map = map;
+          this._update();
+          map.on('moveend zoomend resize', this._update, this);
+        },
+        onRemove: function(map) {
+          map.off('moveend zoomend resize', this._update, this);
+          if (fogCanvas && fogCanvas.parentNode) fogCanvas.parentNode.removeChild(fogCanvas);
+          fogCanvas = null;
+          fogCtx = null;
+        },
+        _update: function() {
+          if (!fogCanvas || !fogCtx) return;
+          var map = this._map;
+          var size = map.getSize();
+          fogCanvas.width = size.x;
+          fogCanvas.height = size.y;
+          var topLeft = map.containerPointToLayerPoint([0, 0]);
+          L.DomUtil.setPosition(fogCanvas, topLeft);
+          // Fill entire canvas with dark fog
+          fogCtx.fillStyle = 'rgba(18, 19, 20, 0.60)';
+          fogCtx.fillRect(0, 0, size.x, size.y);
+          // Punch holes for explored grids
+          fogCtx.globalCompositeOperation = 'destination-out';
+          for (var key in exploredGridKeys) {
+            var parts = key.split(',');
+            var latIdx = parseInt(parts[0], 10);
+            var lngIdx = parseInt(parts[1], 10);
+            var south = latIdx * 0.001;
+            var north = south + 0.001;
+            var west = lngIdx * 0.001;
+            var east = west + 0.001;
+            var nw = map.latLngToContainerPoint([north, west]);
+            var se = map.latLngToContainerPoint([south, east]);
+            fogCtx.fillStyle = 'rgba(0,0,0,1)';
+            fogCtx.fillRect(nw.x, se.y, se.x - nw.x, nw.y - se.y);
+          }
+          fogCtx.globalCompositeOperation = 'source-over';
+        },
+        redraw: function() {
+          this._update();
+        }
+      });
+
+      var fogOverlay = new FogOverlay();
+      fogOverlay.addTo(map);
 
       // ---- User location marker ----
       var userMarker = null;
@@ -204,36 +259,20 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       };
 
       /**
-       * 更新探索网格
+       * 更新迷雾探索网格（Canvas Fog-of-War）
+       * 接收已探索网格 key 数组，更新 fog overlay 并重绘
        */
-      window.updateGrids = function(gridsJson) {
+      window.updateExploredGrids = function(keysArray) {
         try {
-          var grids = JSON.parse(gridsJson);
-          var newKeys = {};
-          for (var i = 0; i < grids.length; i++) {
-            var g = grids[i];
-            newKeys[g.key] = true;
-            if (!gridRectangles[g.key]) {
-              var rect = L.rectangle(
-                [[g.south, g.west], [g.north, g.east]],
-                {
-                  fillColor: '${GRID_FILL_COLOR}',
-                  fillOpacity: 1,
-                  stroke: false,
-                  interactive: false,
-                }
-              ).addTo(map);
-              gridRectangles[g.key] = rect;
-            }
+          exploredGridKeys = {};
+          for (var i = 0; i < keysArray.length; i++) {
+            exploredGridKeys[keysArray[i]] = true;
           }
-          for (var oldKey in gridRectangles) {
-            if (!newKeys[oldKey]) {
-              map.removeLayer(gridRectangles[oldKey]);
-              delete gridRectangles[oldKey];
-            }
+          if (fogOverlay && fogOverlay.redraw) {
+            fogOverlay.redraw();
           }
         } catch (e) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'updateGrids: ' + e.message }));
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', data: 'updateExploredGrids: ' + e.message }));
         }
       };
 
@@ -350,9 +389,10 @@ interface MapContainerProps {
 // ---- Main Component ----
 
 function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
+  // ---- Zustand 精细 Selector 订阅（shallow 浅比较，防止无关状态触发重绘） ----
   const hikeStatus = useHikeStore((s) => s.hikeStatus);
   const currentPath = useHikeStore((s) => s.currentPath);
-  const exploredGrids = useHikeStore((s) => s.exploredGrids);
+  const exploredGrids = useHikeStore(useShallow((s) => s.exploredGrids));
   const appendTrailPoints = useHikeStore((s) => s.appendTrailPoints);
   const setTotalDistance = useHikeStore((s) => s.setTotalDistance);
   const setElevationGain = useHikeStore((s) => s.setElevationGain);
@@ -416,22 +456,11 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     injectCall(webViewRef, 'window.drawTrack', JSON.stringify(coords));
   }, [displayPoints, mapReady]);
 
-  // ---- Sync exploration grids to WebView ----
+  // ---- Sync explored grids to fog-of-war overlay ----
   useEffect(() => {
     if (!mapReady) return;
-
-    const grids = exploredGrids.map((key) => {
-      const parts = key.split(',');
-      const latIndex = parseInt(parts[0], 10);
-      const lngIndex = parseInt(parts[1], 10);
-      const south = latIndex * GRID_SIZE;
-      const north = south + GRID_SIZE;
-      const west = lngIndex * GRID_SIZE;
-      const east = west + GRID_SIZE;
-      return { key, south, north, west, east };
-    });
-
-    injectCall(webViewRef, 'window.updateGrids', JSON.stringify(grids));
+    // 直接发送 key 数组，Leaflet 端用 canvas 裁剪实现迷雾开图
+    injectCall(webViewRef, 'window.updateExploredGrids', exploredGrids);
   }, [exploredGrids, mapReady]);
 
   // ---- Sync tile source to WebView ----

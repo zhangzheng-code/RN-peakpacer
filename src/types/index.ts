@@ -104,6 +104,8 @@ export interface BiometricsRecord {
   timestamp: number;
   /** 心率（bpm） */
   heartRate: number;
+  /** 血氧饱和度（%） */
+  spo2: number;
   /** 生理耗竭指数 */
   pei: number;
 }

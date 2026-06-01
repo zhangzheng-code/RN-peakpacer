@@ -78,6 +78,7 @@ export default function HikeGoScreen() {
       addBiometricsRecord({
         timestamp: Date.now(),
         heartRate: data.heartRate,
+        spo2: data.spO2,
         pei: peiResult.value,
       });
     });

@@ -14,6 +14,7 @@
 
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
+import { shallow } from 'zustand/shallow';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type {
   HikeStatus,
@@ -24,6 +25,25 @@ import type {
   ChatMessage,
   BiometricsRecord,
 } from '../types';
+
+/**
+ * JIT 危险装备卡片触发类型
+ *
+ * - 'oxygen'  : PEI 极高（≥80），推荐便携氧气设备
+ * - 'cold'    : 气温跌破 0℃，推荐防寒冲锋衣
+ * - null      : 无危险，不显示卡片
+ */
+export type HazardAlertType = 'oxygen' | 'cold' | null;
+
+/**
+ * 环境气象数据
+ */
+export interface WeatherData {
+  /** 当前气温（℃） */
+  temp: number;
+  /** 天气状况描述（如 '晴'、'多云'、'暴风雪'） */
+  condition: string;
+}
 
 /**
  * Store 状态接口定义
@@ -69,6 +89,21 @@ interface HikeStoreState {
   /** 是否正在显示警报 */
   isAlertActive: boolean;
 
+  // ---- 环境气象 ----
+
+  /** 当前环境气象数据 */
+  weather: WeatherData;
+
+  // ---- JIT 危险装备卡片 ----
+
+  /**
+   * 当前危险预警类型
+   * - 'oxygen' : PEI ≥ 80，极度疲劳，推荐吸氧设备
+   * - 'cold'   : 气温 < 0℃，推荐防寒装备
+   * - null     : 安全，无卡片
+   */
+  hazardAlert: HazardAlertType;
+
   // ---- Actions ----
 
   /** 开始徒步 */
@@ -100,6 +135,12 @@ interface HikeStoreState {
 
   /** 设置警报激活状态 */
   setAlertActive: (active: boolean) => void;
+
+  /** 更新环境气象数据（来自天气 API 或模拟） */
+  updateWeather: (temp: number, condition: string) => void;
+
+  /** 手动清除危险预警（用户已处理后） */
+  clearHazardAlert: () => void;
 
   /** 删除历史轨迹 */
   deleteHistoryTrack: (id: string) => void;
@@ -138,6 +179,9 @@ interface HikeStoreState {
 
   /** 点亮网格 action */
   exploreGrid: (lat: number, lng: number) => void;
+
+  /** 手动添加单个已探索网格 key（用于回放/导入） */
+  addExploredGrid: (gridKey: string) => void;
 
   /** 批量点亮网格（用于历史轨迹回放） */
   exploreGridsBatch: (points: TrailPoint[]) => void;
@@ -232,6 +276,8 @@ export const useHikeStore = create<HikeStoreState>()(
       biometrics: DEFAULT_BIOMETRICS,
       consecutiveAlertCount: 0,
       isAlertActive: false,
+      weather: { temp: 8, condition: '多云' },
+      hazardAlert: null,
       chatMessages: [],
       exploredGrids: [],
       exploredGridSet: new Set<string>(),
@@ -322,6 +368,14 @@ export const useHikeStore = create<HikeStoreState>()(
         set({ isAlertActive: active });
       },
 
+      updateWeather: (temp, condition) => {
+        set({ weather: { temp, condition } });
+      },
+
+      clearHazardAlert: () => {
+        set({ hazardAlert: null });
+      },
+
       deleteHistoryTrack: (id) => {
         set((prev) => ({
           historyTracks: prev.historyTracks.filter((t) => t.id !== id),
@@ -356,6 +410,17 @@ export const useHikeStore = create<HikeStoreState>()(
         newSet.add(key);
         set({
           exploredGrids: [...state.exploredGrids, key],
+          exploredGridSet: newSet,
+        });
+      },
+
+      addExploredGrid: (gridKey) => {
+        const state = get();
+        if (state.exploredGridSet.has(gridKey)) return;
+        const newSet = new Set(state.exploredGridSet);
+        newSet.add(gridKey);
+        set({
+          exploredGrids: [...state.exploredGrids, gridKey],
           exploredGridSet: newSet,
         });
       },
@@ -396,10 +461,31 @@ export const useHikeStore = create<HikeStoreState>()(
         set((prev) => {
           const next = [...prev.biometricsHistory, record];
           // FIFO sliding window: keep only the last 30 records
-          if (next.length > 30) {
-            return { biometricsHistory: next.slice(next.length - 30) };
+          const biometricsHistory = next.length > 30
+            ? next.slice(next.length - 30)
+            : next;
+
+          // ---- JIT 危险判定（多体征联合触发） ----
+          // 最高优先级：缺氧/高负荷
+          //   - SpO₂ < 90%（严重低氧）
+          //   - 心率 > 120 bpm（高负荷）
+          //   - PEI ≥ 12.0（综合耗竭）
+          // 次高优先级：严寒失温（气温 < 0℃，且无缺氧风险）
+          // 安全：不满足以上条件
+          let hazardAlert: HazardAlertType = prev.hazardAlert;
+          const isOxygenRisk =
+            record.spo2 < 90 || record.heartRate > 120 || record.pei >= 12.0;
+          const isColdRisk = prev.weather.temp < 0;
+
+          if (isOxygenRisk) {
+            hazardAlert = 'oxygen';
+          } else if (isColdRisk) {
+            hazardAlert = 'cold';
+          } else {
+            hazardAlert = null;
           }
-          return { biometricsHistory: next };
+
+          return { biometricsHistory, hazardAlert };
         });
       },
 
@@ -438,6 +524,7 @@ export const useHikeStore = create<HikeStoreState>()(
         historyTracks: state.historyTracks,
         profile: state.profile,
         biometrics: state.biometrics,
+        weather: state.weather,
         chatMessages: state.chatMessages,
         exploredGrids: state.exploredGrids,
       }),
