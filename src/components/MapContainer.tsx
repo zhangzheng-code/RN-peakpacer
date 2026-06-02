@@ -457,10 +457,16 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   }, [displayPoints, mapReady]);
 
   // ---- Sync explored grids to fog-of-war overlay ----
+  const prevGridCountRef = useRef(0);
   useEffect(() => {
     if (!mapReady) return;
     // 直接发送 key 数组，Leaflet 端用 canvas 裁剪实现迷雾开图
     injectCall(webViewRef, 'window.updateExploredGrids', exploredGrids);
+    // 新网格被探索时触发轻微震动（跳过首次加载）
+    if (exploredGrids.length > prevGridCountRef.current && prevGridCountRef.current > 0) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+    prevGridCountRef.current = exploredGrids.length;
   }, [exploredGrids, mapReady]);
 
   // ---- Sync tile source to WebView ----
