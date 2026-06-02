@@ -39,9 +39,9 @@ Git 当前分支：feature/premium-redesign
 
 [ ] 5. 地图网格探索点亮与性能调优 (Footprints & Optimization) (进行中)
 
-[ ] 实现端侧经纬度网格探索度点亮算法 (进行中)
+[ x] 实现端侧经纬度网格探索度点亮算法 (已完成)
 
-[ ] 优化 Zustand Selector 浅比较，攻克 60fps 轨迹渲染性能瓶颈 (待开始)
+[x ] 优化 Zustand Selector 浅比较，攻克 60fps 轨迹渲染性能瓶颈 (已完成)
 
 [ ] 真机 EAS 包最终评测、打包发布与演示录屏准备 (待开始)
 

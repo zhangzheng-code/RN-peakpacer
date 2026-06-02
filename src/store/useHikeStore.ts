@@ -10,6 +10,8 @@
  * - 历史轨迹记录（historyTracks）
  * - 用户生理静态特征（profile）
  * - 生理体征数据（biometrics）
+ * - 账户登录状态（accountState）
+ * - AI 领队对话记录（aiMessages）
  */
 
 import { create } from 'zustand';
@@ -25,6 +27,105 @@ import type {
   ChatMessage,
   BiometricsRecord,
 } from '../types';
+
+// ============================================================
+// 账户状态类型
+// ============================================================
+
+/**
+ * 登录用户信息
+ */
+export interface AccountUser {
+  /** 用户唯一 ID */
+  id: string;
+  /** 用户昵称 */
+  nickname: string;
+  /** 头像 URL（可选） */
+  avatarUrl: string | null;
+  /** 认证 Token */
+  token: string;
+  /** 手机号（脱敏） */
+  phone: string;
+}
+
+/**
+ * 账户登录状态
+ */
+export interface AccountState {
+  /** 是否已登录 */
+  isLoggedIn: boolean;
+  /** 用户信息（未登录时为 null） */
+  user: AccountUser | null;
+  /** 登录请求进行中 */
+  isLoading: boolean;
+  /** 登录失败错误信息 */
+  error: string | null;
+}
+
+/**
+ * 登录请求参数
+ */
+export interface LoginParams {
+  /** 手机号 */
+  phone: string;
+  /** 验证码（Mock 模式下固定为 '123456'） */
+  code: string;
+}
+
+/**
+ * AI 领队对话消息（MiMo 模型专用）
+ * 与 ChatMessage 结构一致，但独立存储以区分 DeepSeek 和 MiMo 的对话上下文
+ */
+export interface AiMessage {
+  /** 消息唯一 ID */
+  id: string;
+  /** 消息角色 */
+  role: 'user' | 'assistant' | 'system';
+  /** 消息文本内容 */
+  content: string;
+  /** 创建时间戳（Unix 毫秒） */
+  timestamp: number;
+  /** 是否正在流式接收中 */
+  isStreaming?: boolean;
+}
+
+/**
+ * Mock 用户数据库
+ * 生产环境替换为真实 API 调用
+ */
+const MOCK_USERS: Record<string, AccountUser> = {
+  '13800000001': {
+    id: 'usr_001',
+    nickname: '山鹰',
+    avatarUrl: null,
+    token: 'mock_jwt_token_001_abc123',
+    phone: '138****0001',
+  },
+  '13800000002': {
+    id: 'usr_002',
+    nickname: '林间风',
+    avatarUrl: null,
+    token: 'mock_jwt_token_002_def456',
+    phone: '138****0002',
+  },
+  '13800000003': {
+    id: 'usr_003',
+    nickname: '云上行者',
+    avatarUrl: null,
+    token: 'mock_jwt_token_003_ghi789',
+    phone: '138****0003',
+  },
+};
+
+/**
+ * 默认账户状态
+ */
+const DEFAULT_ACCOUNT_STATE: AccountState = {
+  isLoggedIn: false,
+  user: null,
+  isLoading: false,
+  error: null,
+};
 
 /**
  * JIT 危险装备卡片触发类型
@@ -203,6 +304,35 @@ interface HikeStoreState {
   /** 设置 Tab 栏可见性 */
   setTabBarVisible: (visible: boolean) => void;
 
+  // ---- 账户状态 ----
+
+  /** 账户登录状态 */
+  accountState: AccountState;
+
+  /**
+   * Mock 登录
+   * 模拟 POST /api/users/login
+   * 验证码固定为 '123456'，手机号匹配 MOCK_USERS 数据库
+   */
+  login: (params: LoginParams) => Promise<boolean>;
+
+  /** 登出并清除账户状态 */
+  logout: () => void;
+
+  // ---- AI 领队对话记录（MiMo 模型专用） ----
+
+  /** AI 领队对话消息列表 */
+  aiMessages: AiMessage[];
+
+  /** 设置 AI 对话消息 */
+  setAiMessages: (messages: AiMessage[]) => void;
+
+  /** 追加 AI 对话消息 */
+  appendAiMessage: (message: AiMessage) => void;
+
+  /** 清空 AI 对话记录 */
+  clearAiMessages: () => void;
+
   // ---- 体征历史（滑动窗口） ----
 
   /** 最近 30 个数据点的体征历史 */
@@ -283,6 +413,8 @@ export const useHikeStore = create<HikeStoreState>()(
       exploredGridSet: new Set<string>(),
       currentTab: 'HikeGo',
       isTabBarVisible: true,
+      accountState: DEFAULT_ACCOUNT_STATE,
+      aiMessages: [],
       biometricsHistory: [],
 
       // ---- Actions 实现 ----
@@ -507,6 +639,90 @@ export const useHikeStore = create<HikeStoreState>()(
           elevationGain: 0,
         });
       },
+
+      // ============================================================
+      // 账户登录（Mock API: POST /api/users/login）
+      // ============================================================
+
+      login: async (params: LoginParams): Promise<boolean> => {
+        set((prev) => ({
+          accountState: { ...prev.accountState, isLoading: true, error: null },
+        }));
+
+        // 模拟网络延迟 800~1500ms
+        const delay = 800 + Math.random() * 700;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+
+        // 验证码校验
+        if (params.code !== '123456') {
+          set((prev) => ({
+            accountState: {
+              ...prev.accountState,
+              isLoading: false,
+              error: '验证码错误，请输入 123456',
+            },
+          }));
+          return false;
+        }
+
+        // 查询 Mock 用户数据库
+        const user = MOCK_USERS[params.phone];
+        if (!user) {
+          // 手机号不在数据库中，自动创建新用户
+          const newUser: AccountUser = {
+            id: `usr_${Date.now().toString(36)}`,
+            nickname: `徒步者${params.phone.slice(-4)}`,
+            avatarUrl: null,
+            token: `mock_jwt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            phone: `${params.phone.slice(0, 3)}****${params.phone.slice(-4)}`,
+          };
+          set({
+            accountState: {
+              isLoggedIn: true,
+              user: newUser,
+              isLoading: false,
+              error: null,
+            },
+          });
+          return true;
+        }
+
+        // 登录成功
+        set({
+          accountState: {
+            isLoggedIn: true,
+            user: { ...user },
+            isLoading: false,
+            error: null,
+          },
+        });
+        return true;
+      },
+
+      logout: () => {
+        set({
+          accountState: DEFAULT_ACCOUNT_STATE,
+          aiMessages: [],
+        });
+      },
+
+      // ============================================================
+      // AI 领队对话记录（MiMo 模型专用）
+      // ============================================================
+
+      setAiMessages: (messages) => {
+        set({ aiMessages: messages });
+      },
+
+      appendAiMessage: (message) => {
+        set((prev) => ({
+          aiMessages: [...prev.aiMessages, message],
+        }));
+      },
+
+      clearAiMessages: () => {
+        set({ aiMessages: [] });
+      },
     }),
     {
       name: 'smarthike-store',
@@ -527,6 +743,8 @@ export const useHikeStore = create<HikeStoreState>()(
         weather: state.weather,
         chatMessages: state.chatMessages,
         exploredGrids: state.exploredGrids,
+        accountState: state.accountState,
+        aiMessages: state.aiMessages,
       }),
       /**
        * onRehydrateStorage: 从 AsyncStorage 恢复后，

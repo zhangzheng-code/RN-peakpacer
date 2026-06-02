@@ -389,20 +389,37 @@ interface MapContainerProps {
 // ---- Main Component ----
 
 function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
-  // ---- Zustand 精细 Selector 订阅（shallow 浅比较，防止无关状态触发重绘） ----
+  // ================================================================
+  // Zustand 原子化 Selector 订阅（60fps 性能隔离核心）
+  // ================================================================
+  // 规则：
+  //   1. 高频数组（currentPath, exploredGrids）使用 shallow 浅比较
+  //   2. 高频 primitive（hikeStatus）使用 primitive selector（Object.is 天然稳定）
+  //   3. 函数引用（appendTrailPoints 等）在 Zustand v5 中天然稳定，无需额外处理
+  //   4. 当 duration/speed/weather 等 HUD 数据高频跳动时，MapContainer 零重绘
+
   const hikeStatus = useHikeStore((s) => s.hikeStatus);
-  const currentPath = useHikeStore((s) => s.currentPath);
   const exploredGrids = useHikeStore(useShallow((s) => s.exploredGrids));
   const appendTrailPoints = useHikeStore((s) => s.appendTrailPoints);
   const setTotalDistance = useHikeStore((s) => s.setTotalDistance);
   const setElevationGain = useHikeStore((s) => s.setElevationGain);
   const exploreGridsBatch = useHikeStore((s) => s.exploreGridsBatch);
 
+  // ---- 路径长度追踪（useRef 替代 currentPath 订阅，杜绝数组引用变更触发重绘） ----
+  const trailPathLengthRef = useRef(0);
+
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
   const [hasLocationPermission, setHasLocationPermission] = useState(false);
   const [displayPoints, setDisplayPoints] = useState<TrailPoint[]>([]);
   const [loadingDismissed, setLoadingDismissed] = useState(false);
   const [mapReady, setMapReady] = useState(false);
+
+  // ---- 渲染计数器（开发环境验证：HUD 跳字时 MapContainer 重绘次数 = 0） ----
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+  if (__DEV__) {
+    console.log(`[MapContainer] render #${renderCountRef.current}`);
+  }
 
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const webViewRef = useRef<WebView>(null);
@@ -424,6 +441,16 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   }, [loadingOpacity]);
 
   const isRecording = hikeStatus === 'recording';
+
+  // ---- 徒步状态变更时重置路径长度追踪 ----
+  const prevRecordingRef = useRef(false);
+  useEffect(() => {
+    if (isRecording && !prevRecordingRef.current) {
+      // 开始录制 → 重置路径长度（新轨迹从 0 开始）
+      trailPathLengthRef.current = 0;
+    }
+    prevRecordingRef.current = isRecording;
+  }, [isRecording]);
 
   // ---- Handle messages from WebView ----
   const handleWebViewMessage = useCallback((event: WebViewMessageEvent) => {
@@ -582,10 +609,10 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         }
         setElevationGain(gain);
 
-        const newPoints = bufferedPoints.slice(currentPath.length);
-        appendTrailPoints(newPoints);
-
+        const newPoints = bufferedPoints.slice(trailPathLengthRef.current);
         if (newPoints.length > 0) {
+          appendTrailPoints(newPoints);
+          trailPathLengthRef.current += newPoints.length;
           exploreGridsBatch(newPoints);
         }
       }
@@ -597,7 +624,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         pollTimerRef.current = null;
       }
     };
-  }, [isRecording, currentPath.length, appendTrailPoints, setTotalDistance, setElevationGain, exploreGridsBatch]);
+  }, [isRecording, appendTrailPoints, setTotalDistance, setElevationGain, exploreGridsBatch]);
 
   // ---- Cleanup ----
   useEffect(() => {
