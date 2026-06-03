@@ -95,6 +95,111 @@ export type MimoStreamCallback = (
 ) => void;
 
 // ============================================================
+// 网络重试配置
+// ============================================================
+
+/** 最大重试次数 */
+const MAX_RETRIES = 3;
+
+/** 基础重试延迟（ms），指数退避：1s → 2s → 4s */
+const RETRY_BASE_DELAY_MS = 1000;
+
+/** 单次请求超时（ms） */
+const REQUEST_TIMEOUT_MS = 60000;
+
+/**
+ * 判断错误是否为可重试的网络异常
+ * 仅对连接断开、超时、DNS 失败等网络层错误重试，
+ * 不对 4xx API 错误重试。
+ */
+function isRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return (
+    msg.includes('socket') ||
+    msg.includes('network') ||
+    msg.includes('aborted') ||
+    msg.includes('timeout') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('fetch failed') ||
+    msg.includes('unexpected end') ||
+    msg.includes('closed unexpectedly')
+  );
+}
+
+/**
+ * 带指数退避的 fetch 重试包装器
+ *
+ * 兼容 Hermes 引擎：不使用 AbortSignal.any（Hermes 不支持），
+ * 改用轮询检测外部 signal + 内部超时的双层控制。
+ *
+ * @param url     - 请求地址
+ * @param options - fetch 选项（不含 signal，由内部管理超时）
+ * @param signal  - 外部 AbortSignal（用于 UI 取消）
+ * @returns Response 对象
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // 如果外部已取消，直接中止
+    if (signal?.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+
+    // 为每次请求创建独立的超时控制器
+    const timeoutController = new AbortController();
+
+    // 监听外部取消信号 → 转发到超时控制器
+    let onAbort: (() => void) | null = null;
+    if (signal) {
+      onAbort = () => timeoutController.abort();
+      signal.addEventListener('abort', onAbort);
+    }
+
+    const timeoutTimer = setTimeout(() => timeoutController.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: timeoutController.signal,
+      });
+      clearTimeout(timeoutTimer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutTimer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      lastError = error;
+
+      // 外部取消不重试
+      if (signal?.aborted) throw error;
+
+      // 可重试且还有剩余次数
+      if (isRetryableError(error) && attempt < MAX_RETRIES) {
+        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        console.warn(
+          `[MiMo] 网络异常，${delay}ms 后第 ${attempt + 2}/${MAX_RETRIES + 1} 次重试:`,
+          (error as Error).message,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      // 不可重试或已耗尽重试次数
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+// ============================================================
 // 内部工具函数
 // ============================================================
 
@@ -155,7 +260,7 @@ function isStreamSupported(response: Response): boolean {
  */
 async function sendNonStreaming(messages: MimoMessage[]): Promise<string> {
   const endpoint = getMimoEndpoint();
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -241,21 +346,24 @@ export async function sendMimoStream(
 
   const endpoint = getMimoEndpoint();
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+  const response = await fetchWithRetry(
+    endpoint,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL_ID,
+        messages,
+        stream: true,
+        temperature: DEFAULT_TEMPERATURE,
+        max_tokens: DEFAULT_MAX_TOKENS,
+      }),
     },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      messages,
-      stream: true,
-      temperature: DEFAULT_TEMPERATURE,
-      max_tokens: DEFAULT_MAX_TOKENS,
-    }),
     signal,
-  });
+  );
 
   if (!response.ok) {
     const errText = await response.text();

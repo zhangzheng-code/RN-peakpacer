@@ -19,6 +19,94 @@
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 const DEEPSEEK_MODEL = 'deepseek-chat';
 
+/** 最大重试次数 */
+const MAX_RETRIES = 3;
+
+/** 基础重试延迟（ms），指数退避：1s → 2s → 4s */
+const RETRY_BASE_DELAY_MS = 1000;
+
+/** 单次请求超时（ms） */
+const REQUEST_TIMEOUT_MS = 60000;
+
+/**
+ * 判断错误是否为可重试的网络异常
+ */
+function isRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return (
+    msg.includes('socket') ||
+    msg.includes('network') ||
+    msg.includes('aborted') ||
+    msg.includes('timeout') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('fetch failed') ||
+    msg.includes('unexpected end') ||
+    msg.includes('closed unexpectedly')
+  );
+}
+
+/**
+ * 带指数退避的 fetch 重试包装器
+ *
+ * 兼容 Hermes 引擎：不使用 AbortSignal.any，
+ * 改用外部 signal 监听转发到内部 AbortController。
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+
+    const timeoutController = new AbortController();
+
+    let onAbort: (() => void) | null = null;
+    if (signal) {
+      onAbort = () => timeoutController.abort();
+      signal.addEventListener('abort', onAbort);
+    }
+
+    const timeoutTimer = setTimeout(() => timeoutController.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: timeoutController.signal,
+      });
+      clearTimeout(timeoutTimer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutTimer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      lastError = error;
+
+      if (signal?.aborted) throw error;
+
+      if (isRetryableError(error) && attempt < MAX_RETRIES) {
+        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        console.warn(
+          `[DeepSeek] 网络异常，${delay}ms 后第 ${attempt + 2}/${MAX_RETRIES + 1} 次重试:`,
+          (error as Error).message,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
 /**
  * API Key 存储
  */
@@ -117,7 +205,7 @@ function isStreamSupported(response: Response): boolean {
 async function sendNonStreamingChat(
   messages: ChatCompletionMessage[],
 ): Promise<string> {
-  const response = await fetch(DEEPSEEK_API_URL, {
+  const response = await fetchWithRetry(DEEPSEEK_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -199,21 +287,24 @@ export async function sendStreamingChat(
     throw new Error('DeepSeek API Key 未设置，请先调用 setDeepSeekApiKey()');
   }
 
-  const response = await fetch(DEEPSEEK_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+  const response = await fetchWithRetry(
+    DEEPSEEK_API_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: 2048,
+      }),
     },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages,
-      stream: true,
-      temperature: 0.7,
-      max_tokens: 2048,
-    }),
     signal,
-  });
+  );
 
   if (!response.ok) {
     const errorText = await response.text();

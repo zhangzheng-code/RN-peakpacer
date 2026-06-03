@@ -9,23 +9,38 @@
  * - 一键入队 + GPX 轨迹导入数据闭环
  */
 
-import React, { useCallback } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   Platform,
+  ActivityIndicator,
 } from 'react-native';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
   withSpring,
+  withTiming,
+  withDelay,
+  runOnJS,
 } from 'react-native-reanimated';
+import Svg, { Path, Defs, LinearGradient, Stop } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import { useHikeStore } from '../store/useHikeStore';
+import {
+  scoreMatch,
+  calcPressure,
+  estimateTime,
+  generateTerrain,
+  estimateFitnessLevel,
+  type MatchScore,
+  type DifficultyLevel,
+} from '../utils/matchEngine';
+import MatchScanOverlay, { type MatchResult } from '../components/MatchScanOverlay';
 
 // ---- Types ----
 
@@ -176,13 +191,46 @@ const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
 
 function PartnerCard({ activity }: { activity: PartnerActivity }) {
   const importRoutePath = useHikeStore((s) => s.importRoutePath);
+  const profile = useHikeStore((s) => s.profile);
+  const historyTracks = useHikeStore((s) => s.historyTracks);
   const navigation = useNavigation();
 
   const scale = useSharedValue(1);
+  const joinOpacity = useSharedValue(1);
 
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [{ scale: scale.value }],
   }));
+
+  // ---- 硬核标签计算 ----
+  const matchScore = useMemo(
+    () => scoreMatch(profile, historyTracks, activity.difficulty as DifficultyLevel, activity.departDate),
+    [profile, historyTracks, activity.difficulty, activity.departDate],
+  );
+  const pressure = useMemo(() => calcPressure(activity.elevationGain), [activity.elevationGain]);
+  const timeEst = useMemo(() => estimateTime(activity.distance, activity.elevationGain), [activity.distance, activity.elevationGain]);
+  const terrain = useMemo(() => generateTerrain(activity.difficulty as DifficultyLevel), [activity.difficulty]);
+
+  // ---- 合成高程剖面 SVG path ----
+  const profilePath = useMemo(() => {
+    const points = 12;
+    const w = 200;
+    const h = 32;
+    const peak = activity.elevationGain;
+    // 生成一个先升后降的剖面
+    const coords: string[] = [];
+    for (let i = 0; i < points; i++) {
+      const x = (i / (points - 1)) * w;
+      const t = i / (points - 1);
+      // 双峰正态分布模拟真实剖面
+      const y = h - (h * 0.9) * (
+        0.6 * Math.exp(-Math.pow((t - 0.35) * 4, 2)) +
+        0.4 * Math.exp(-Math.pow((t - 0.7) * 3.5, 2))
+      ) + (Math.random() - 0.5) * 3;
+      coords.push(`${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    return coords.join(' ');
+  }, [activity.elevationGain]);
 
   const handlePressIn = useCallback(() => {
     scale.value = withSpring(0.97, {
@@ -200,13 +248,24 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
     });
   }, [scale]);
 
+  const [isJoining, setIsJoining] = React.useState(false);
+
   const handleJoin = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    importRoutePath(activity.path);
+    setIsJoining(true);
+    // 按钮 loading 动画
+    joinOpacity.value = withTiming(0.6, { duration: 200 });
+    // 延迟模拟网络请求，然后跳转
     setTimeout(() => {
+      importRoutePath(activity.path);
       navigation.navigate('HikeGo' as never);
-    }, 150);
-  }, [activity.path, importRoutePath, navigation]);
+      // 重置状态（返回时）
+      setTimeout(() => {
+        setIsJoining(false);
+        joinOpacity.value = withTiming(1, { duration: 200 });
+      }, 500);
+    }, 600);
+  }, [activity.path, importRoutePath, navigation, joinOpacity]);
 
   const isFull = activity.currentCount >= activity.maxCount;
   const statusColor =
@@ -278,6 +337,98 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
             <Text style={styles.statLabel}>出发</Text>
           </View>
         </View>
+
+        {/* ---- 硬核标签区 ---- */}
+        <View style={styles.labelsSection}>
+          {/* 高程剖面 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>高程剖面</Text>
+            <Svg width={100} height={20} viewBox="0 0 200 32">
+              <Defs>
+                <LinearGradient id={`grad-${activity.id}`} x1="0" y1="0" x2="0" y2="1">
+                  <Stop offset="0" stopColor="#10B981" stopOpacity="0.4" />
+                  <Stop offset="1" stopColor="#10B981" stopOpacity="0.05" />
+                </LinearGradient>
+              </Defs>
+              <Path
+                d={profilePath + ` L200,32 L0,32 Z`}
+                fill={`url(#grad-${activity.id})`}
+              />
+              <Path
+                d={profilePath}
+                fill="none"
+                stroke="#10B981"
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+            </Svg>
+            <Text style={styles.labelValue}>↑{activity.elevationGain}m</Text>
+          </View>
+
+          {/* 气压预警 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>气压预警</Text>
+            <Text style={[styles.labelValue, pressure.isWarning && styles.labelWarning]}>
+              {pressure.value} hPa
+            </Text>
+            {pressure.isWarning && (
+              <Text style={styles.labelAlert}>⚠️ {pressure.warningText}</Text>
+            )}
+          </View>
+
+          {/* AI 推荐度 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>AI 推荐度</Text>
+            <View style={styles.progressBar}>
+              <View
+                style={[
+                  styles.progressFill,
+                  {
+                    width: `${matchScore.overall}%`,
+                    backgroundColor: matchScore.overall >= 80 ? '#10B981' : matchScore.overall >= 60 ? '#F59E0B' : '#6B7280',
+                  },
+                ]}
+              />
+            </View>
+            <Text style={[styles.labelValue, { color: matchScore.overall >= 80 ? '#10B981' : '#F59E0B' }]}>
+              {matchScore.overall}%
+            </Text>
+          </View>
+
+          {/* 体征匹配 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>体征匹配</Text>
+            <Text style={styles.labelDetail}>
+              ♥ {matchScore.bodyFit}分 · 难度 {matchScore.difficultyFit}分
+            </Text>
+          </View>
+
+          {/* 路况指数 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>路况指数</Text>
+            <View style={styles.terrainBar}>
+              {terrain.segments.map((seg, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.terrainSegment,
+                    { flex: seg.percent, backgroundColor: seg.color },
+                  ]}
+                />
+              ))}
+            </View>
+            <Text style={styles.labelDetail}>
+              {terrain.segments.map((s) => `${s.type}${s.percent}%`).join(' / ')}
+            </Text>
+          </View>
+
+          {/* 预计用时 */}
+          <View style={styles.labelRow}>
+            <Text style={styles.labelKey}>预计用时</Text>
+            <Text style={styles.labelValueBold}>{timeEst.formatted}</Text>
+            <Text style={styles.labelDetail}>({timeEst.confidenceRange})</Text>
+          </View>
+        </View>
       </View>
 
       {/* Bottom: Status + action */}
@@ -303,12 +454,16 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
         <TouchableOpacity
           activeOpacity={0.8}
           onPress={handleJoin}
-          disabled={isFull}
-          style={[styles.joinButton, isFull && styles.joinButtonDisabled]}
+          disabled={isFull || isJoining}
+          style={[styles.joinButton, isFull && styles.joinButtonDisabled, isJoining && styles.joinButtonJoining]}
         >
-          <Text style={[styles.joinButtonText, isFull && styles.joinButtonTextDisabled]}>
-            {isFull ? '已满员' : '加入同队'}
-          </Text>
+          {isJoining ? (
+            <ActivityIndicator size="small" color="#FFFFFF" />
+          ) : (
+            <Text style={[styles.joinButtonText, isFull && styles.joinButtonTextDisabled]}>
+              {isFull ? '已满员' : '加入同队'}
+            </Text>
+          )}
         </TouchableOpacity>
       </View>
     </AnimatedTouchable>
@@ -319,6 +474,44 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
 
 export default function PartnerScreen() {
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation();
+  const profile = useHikeStore((s) => s.profile);
+  const historyTracks = useHikeStore((s) => s.historyTracks);
+  const isMatchVisible = useHikeStore((s) => s.isMatchVisible);
+  const showMatch = useHikeStore((s) => s.showMatch);
+  const hideMatch = useHikeStore((s) => s.hideMatch);
+
+  const importRoutePath = useHikeStore((s) => s.importRoutePath);
+
+  // 计算匹配结果
+  const matchResults: MatchResult[] = useMemo(() => {
+    return MOCK_PARTNERS
+      .map((a) => ({
+        id: a.id,
+        trailName: a.trailName,
+        leaderName: a.leaderName,
+        leaderAvatar: a.leaderAvatar,
+        score: scoreMatch(profile, historyTracks, a.difficulty as DifficultyLevel, a.departDate),
+        difficulty: a.difficulty,
+        elevationGain: a.elevationGain,
+        distance: a.distance,
+        path: a.path,
+      }))
+      .sort((a, b) => b.score.overall - a.score.overall);
+  }, [profile, historyTracks]);
+
+  const handleOpenMatch = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    showMatch();
+  }, [showMatch]);
+
+  const handleMatchCardPress = useCallback((result: MatchResult) => {
+    hideMatch();
+    importRoutePath(result.path);
+    setTimeout(() => {
+      navigation.navigate('HikeGo' as never);
+    }, 200);
+  }, [hideMatch, importRoutePath, navigation]);
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -329,13 +522,18 @@ export default function PartnerScreen() {
       </View>
 
       {/* Smart match banner */}
-      <View style={styles.matchBanner}>
+      <TouchableOpacity
+        activeOpacity={0.85}
+        onPress={handleOpenMatch}
+        style={styles.matchBanner}
+      >
         <Text style={styles.matchIcon}>🤝</Text>
         <View style={styles.matchInfo}>
           <Text style={styles.matchTitle}>智能匹配</Text>
           <Text style={styles.matchDesc}>根据体能、偏好、时间自动推荐搭子</Text>
         </View>
-      </View>
+        <Text style={styles.matchArrow}>›</Text>
+      </TouchableOpacity>
 
       {/* Section title */}
       <View style={styles.sectionHeader}>
@@ -355,6 +553,14 @@ export default function PartnerScreen() {
           <PartnerCard key={activity.id} activity={activity} />
         ))}
       </Animated.ScrollView>
+
+      {/* Match scan overlay */}
+      <MatchScanOverlay
+        visible={isMatchVisible}
+        onClose={hideMatch}
+        results={matchResults}
+        onCardPress={handleMatchCardPress}
+      />
     </View>
   );
 }
@@ -640,5 +846,81 @@ const styles = StyleSheet.create({
   },
   joinButtonTextDisabled: {
     color: '#6B7280',
+  },
+  joinButtonJoining: {
+    opacity: 0.7,
+    minWidth: 90,
+    alignItems: 'center',
+  },
+  // ---- Match banner arrow ----
+  matchArrow: {
+    fontSize: 22,
+    color: '#10B981',
+    fontWeight: '300',
+    marginLeft: 8,
+  },
+  // ---- Hardcore labels section ----
+  labelsSection: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.04)',
+    gap: 6,
+  },
+  labelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  labelKey: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.35)',
+    width: 56,
+  },
+  labelValue: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#9CA3AF',
+    fontVariant: ['tabular-nums'],
+  },
+  labelValueBold: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#E5E7EB',
+    fontVariant: ['tabular-nums'],
+  },
+  labelWarning: {
+    color: '#F59E0B',
+  },
+  labelAlert: {
+    fontSize: 9,
+    color: '#F59E0B',
+    marginLeft: 4,
+  },
+  labelDetail: {
+    fontSize: 9,
+    color: 'rgba(255,255,255,0.3)',
+  },
+  progressBar: {
+    flex: 1,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 2,
+  },
+  terrainBar: {
+    flex: 1,
+    flexDirection: 'row',
+    height: 6,
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  terrainSegment: {
+    height: '100%',
   },
 });

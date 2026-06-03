@@ -31,6 +31,7 @@ import {
 } from '../tasks/backgroundLocationTask';
 import { useHikeStore } from '../store/useHikeStore';
 import { useShallow } from 'zustand/shallow';
+import { TeammateAnimator } from '../utils/teammateAnimator';
 import type { UserLocation, TrailPoint, TileSourceType } from '../types';
 
 // ---- Constants ----
@@ -40,8 +41,17 @@ const INITIAL_LNG = 108.948;
 const INITIAL_ZOOM = 13;
 const GRID_SIZE = 0.001;
 
+// ---- 瓦片源：使用全球可用 + 国内可用的多源方案 ----
+// 主力：OpenStreetMap（全球覆盖，无反爬限制）
+const OSM_STANDARD_URL =
+  'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+// 备用：高德（国内中文标注，但可能有反爬限制）
 const AMAP_STANDARD_URL =
   'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}';
+// 卫星：ESRI World Imagery（全球覆盖，免费）
+const ESRI_SATELLITE_URL =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+// 卫星备用：高德
 const AMAP_SATELLITE_URL =
   'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}';
 
@@ -81,6 +91,16 @@ const LEAFLET_HTML = `<!DOCTYPE html>
     .leaflet-control-attribution { display: none !important; }
     .leaflet-control-zoom { display: none !important; }
     .leaflet-tile-pane { opacity: 1; }
+    .fog-overlay {
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      pointer-events: none;
+      background: transparent !important;
+      z-index: 450;
+    }
   </style>
 </head>
 <body>
@@ -99,23 +119,59 @@ const LEAFLET_HTML = `<!DOCTYPE html>
         markerZoomAnimation: false,
       });
 
-      // ---- Tile layers ----
-      var standardTile = L.tileLayer('${AMAP_STANDARD_URL}', {
-        maxZoom: 18,
-        tileSize: 256,
-        updateWhenIdle: true,
-        updateWhenZooming: false,
-      });
+      // ---- Tile layers (多源 + 错误回退) ----
+      var tileErrorCount = {};
 
-      var satelliteTile = L.tileLayer('${AMAP_SATELLITE_URL}', {
-        maxZoom: 18,
-        tileSize: 256,
-        updateWhenIdle: true,
-        updateWhenZooming: false,
+      function createTileLayer(url, options) {
+        var layer = L.tileLayer(url, Object.assign({
+          maxZoom: 18,
+          tileSize: 256,
+          updateWhenIdle: false,
+          updateWhenZooming: false,
+          // 注意：不要设 crossOrigin:true，某些瓦片服务器不返回 CORS 头会导致加载失败
+          errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAABlJREFUCNdjYGBg+A8AAQQBAScLVDUAAAAASUVORK5CYII=',
+        }, options || {}));
+        // 瓦片加载失败计数 → 超过阈值通知 RN 端
+        layer.on('tileerror', function(e) {
+          var key = url.substring(0, 30);
+          tileErrorCount[key] = (tileErrorCount[key] || 0) + 1;
+          if (tileErrorCount[key] === 5) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              type: 'tileError',
+              url: url,
+              count: tileErrorCount[key]
+            }));
+          }
+        });
+        layer.on('load', function() {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'tilesLoaded' }));
+        });
+        return layer;
+      }
+
+      // 主力瓦片：OpenStreetMap（全球覆盖）
+      var standardTile = createTileLayer('${OSM_STANDARD_URL}');
+      // 卫星瓦片：ESRI（全球覆盖）
+      var satelliteTile = createTileLayer('${ESRI_SATELLITE_URL}');
+
+      var currentTileType = 'standard';
+
+      // 回退瓦片源（主力加载失败时自动切换）
+      var amapStandardTile = createTileLayer('${AMAP_STANDARD_URL}');
+      var amapSatelliteTile = createTileLayer('${AMAP_SATELLITE_URL}');
+
+      // 检测主力瓦片是否加载成功，失败则切换到高德
+      var standardFallbackDone = false;
+      standardTile.on('tileerror', function() {
+        if (!standardFallbackDone) {
+          standardFallbackDone = true;
+          map.removeLayer(standardTile);
+          amapStandardTile.addTo(map);
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'tileFallback', to: 'amap' }));
+        }
       });
 
       standardTile.addTo(map);
-      var currentTileType = 'standard';
 
       // ---- Trail polyline (created once, updated in-place) ----
       var trailPolyline = null;
@@ -144,17 +200,22 @@ const LEAFLET_HTML = `<!DOCTYPE html>
         _update: function() {
           if (!fogCanvas || !fogCtx) return;
           var map = this._map;
-          var size = map.getSize();
-          fogCanvas.width = size.x;
-          fogCanvas.height = size.y;
-          var topLeft = map.containerPointToLayerPoint([0, 0]);
-          L.DomUtil.setPosition(fogCanvas, topLeft);
-          // Fill entire canvas with dark fog
-          fogCtx.fillStyle = 'rgba(18, 19, 20, 0.60)';
-          fogCtx.fillRect(0, 0, size.x, size.y);
-          // Punch holes for explored grids
+          var container = map.getContainer();
+          if (!container) return;
+          var w = container.clientWidth;
+          var h = container.clientHeight;
+          if (w === 0 || h === 0) return;
+          // CSS class .fog-overlay handles positioning; only sync canvas pixel size
+          fogCanvas.width = w;
+          fogCanvas.height = h;
+          // Clear then fill with dark fog
+          fogCtx.clearRect(0, 0, w, h);
+          fogCtx.fillStyle = 'rgba(18, 19, 20, 0.45)';
+          fogCtx.fillRect(0, 0, w, h);
+          // Punch holes for explored grids using destination-out compositing
           fogCtx.globalCompositeOperation = 'destination-out';
           for (var key in exploredGridKeys) {
+            if (!exploredGridKeys.hasOwnProperty(key)) continue;
             var parts = key.split(',');
             var latIdx = parseInt(parts[0], 10);
             var lngIdx = parseInt(parts[1], 10);
@@ -311,12 +372,23 @@ const LEAFLET_HTML = `<!DOCTYPE html>
         } catch (e) {}
       };
 
+      // ---- 用户位置跟随模式 ----
+      var followMode = true;
+
+      // 用户手动拖拽地图时，关闭跟随模式
+      map.on('dragstart', function() {
+        followMode = false;
+      });
+
       /**
-       * 设置/更新用户位置标记（使用 setView，不用 fitBounds）
+       * 设置/更新用户位置标记
+       * - 首次调用：创建标记 + 自动居中
+       * - 后续调用：更新标记位置 + 仅在跟随模式下居中
        */
       window.setUserLocation = function(lat, lng) {
         try {
           var latlng = [lat, lng];
+          var isFirst = !userMarker;
           if (userMarker) {
             userMarker.setLatLng(latlng);
           } else {
@@ -340,9 +412,18 @@ const LEAFLET_HTML = `<!DOCTYPE html>
               opacity: 0.4,
             }).addTo(map);
           }
-          // 单点定位：setView，绝不 fitBounds
-          map.setView(latlng, 16, { animate: true, duration: 0.5 });
+          // 首次定位或跟随模式 → 自动居中
+          if (isFirst || followMode) {
+            map.setView(latlng, 16, { animate: true, duration: 0.5 });
+          }
         } catch (e) {}
+      };
+
+      /**
+       * 重新开启跟随模式（RN 端可调用，比如点击"定位"按钮）
+       */
+      window.enableFollowMode = function() {
+        followMode = true;
       };
 
       /**
@@ -350,6 +431,71 @@ const LEAFLET_HTML = `<!DOCTYPE html>
        */
       window.refreshView = function() {
         map.invalidateSize({ animate: false });
+      };
+
+      // ---- 队友标记管理 ----
+      var teammateMarkers = {};
+
+      /**
+       * 初始化队友标记（首次调用）
+       */
+      window.addTeammates = function(teammatesJson) {
+        try {
+          var teammates = JSON.parse(teammatesJson);
+          for (var i = 0; i < teammates.length; i++) {
+            var t = teammates[i];
+            if (teammateMarkers[t.id]) continue;
+            var icon = L.divIcon({
+              className: 'tm-container',
+              html: '<div style="position:relative;width:48px;height:64px;">' +
+                    '<div style="position:absolute;width:52px;height:52px;top:0;left:-2px;border-radius:50%;border:2px solid ' + t.color + ';opacity:0.3;animation:tm-pulse 2s ease-in-out infinite;"></div>' +
+                    '<div style="position:absolute;width:36px;height:36px;top:8px;left:6px;border-radius:50%;background:' + t.color + ';display:flex;align-items:center;justify-content:center;border:2px solid rgba(255,255,255,0.3);box-shadow:0 2px 12px rgba(0,0,0,0.5);">' +
+                    '<span style="font-size:18px;">' + t.emoji + '</span></div>' +
+                    '<div style="position:absolute;top:-6px;right:-18px;background:rgba(0,0,0,0.75);border-radius:10px;padding:2px 6px;display:flex;align-items:center;gap:2px;">' +
+                    '<span style="color:#EF4444;font-size:8px;">♥</span>' +
+                    '<span class="tm-hr-val" style="color:#fff;font-size:10px;font-weight:700;">' + t.heartRate + '</span></div>' +
+                    '<div style="position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);font-size:9px;color:rgba(255,255,255,0.5);white-space:nowrap;">' + t.name + '</div></div>',
+              iconSize: [48, 64],
+              iconAnchor: [24, 32],
+            });
+            var marker = L.marker([t.lat, t.lng], { icon: icon, interactive: false }).addTo(map);
+            teammateMarkers[t.id] = marker;
+          }
+        } catch (e) {}
+      };
+
+      /**
+       * 更新队友位置和心率（每秒调用）
+       */
+      window.updateTeammates = function(teammatesJson) {
+        try {
+          var teammates = JSON.parse(teammatesJson);
+          for (var i = 0; i < teammates.length; i++) {
+            var t = teammates[i];
+            var marker = teammateMarkers[t.id];
+            if (marker) {
+              marker.setLatLng([t.lat, t.lng]);
+              // 更新心率数字
+              var el = marker.getElement();
+              if (el) {
+                var hrEl = el.querySelector('.tm-hr-val');
+                if (hrEl) hrEl.textContent = t.heartRate;
+              }
+            }
+          }
+        } catch (e) {}
+      };
+
+      /**
+       * 清除所有队友标记
+       */
+      window.clearTeammates = function() {
+        try {
+          for (var id in teammateMarkers) {
+            map.removeLayer(teammateMarkers[id]);
+          }
+          teammateMarkers = {};
+        } catch (e) {}
       };
     })();
   <\/script>
@@ -424,6 +570,8 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const webViewRef = useRef<WebView>(null);
   const isMountedRef = useRef(true);
+  const animatorRef = useRef(new TeammateAnimator());
+  const teammatesInitedRef = useRef(false);
 
   const loadingOpacity = useSharedValue(1);
 
@@ -432,13 +580,19 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     pointerEvents: loadingOpacity.value > 0.01 ? 'auto' : 'none',
   }));
 
+  const refreshMapView = useCallback(() => {
+    injectCall(webViewRef, 'window.refreshView');
+  }, []);
+
   const dismissLoadingOverlay = useCallback(() => {
     loadingOpacity.value = withTiming(0, { duration: 300 }, (finished) => {
       if (finished) {
         runOnJS(setLoadingDismissed)(true);
+        // 遮罩消失后强制刷新地图视口，防止白屏
+        runOnJS(refreshMapView)();
       }
     });
-  }, [loadingOpacity]);
+  }, [loadingOpacity, refreshMapView]);
 
   const isRecording = hikeStatus === 'recording';
 
@@ -448,9 +602,18 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     if (isRecording && !prevRecordingRef.current) {
       // 开始录制 → 重置路径长度（新轨迹从 0 开始）
       trailPathLengthRef.current = 0;
+      teammatesInitedRef.current = false;
+    }
+    if (!isRecording && prevRecordingRef.current) {
+      // 停止录制 → 清除队友标记
+      if (mapReady) {
+        injectCall(webViewRef, 'window.clearTeammates');
+      }
+      animatorRef.current.reset();
+      teammatesInitedRef.current = false;
     }
     prevRecordingRef.current = isRecording;
-  }, [isRecording]);
+  }, [isRecording, mapReady]);
 
   // ---- Handle messages from WebView ----
   const handleWebViewMessage = useCallback((event: WebViewMessageEvent) => {
@@ -464,6 +627,15 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           break;
         case 'error':
           console.warn('Leaflet error:', msg.data);
+          break;
+        case 'tileError':
+          console.warn(`[Map] 瓦片加载失败: ${msg.url} (累计 ${msg.count} 次)`);
+          break;
+        case 'tilesLoaded':
+          if (__DEV__) console.log('[Map] 瓦片加载完成');
+          break;
+        case 'tileFallback':
+          console.warn(`[Map] 瓦片源切换至: ${msg.to}`);
           break;
       }
     } catch {
@@ -517,9 +689,18 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     lastTapRef.current = now;
   }, [dismissLoadingOverlay, mapReady]);
 
-  // ---- Location permission with timeout & fallback ----
+  // ---- Location permission + continuous foreground tracking ----
   useEffect(() => {
     let cancelled = false;
+    let watchSubscription: Location.LocationSubscription | null = null;
+
+    /**
+     * 判断坐标是否在中国大陆范围内（粗略判断）
+     * 纬度 18°~54°，经度 73°~135°
+     */
+    function isInChina(lat: number, lng: number): boolean {
+      return lat >= 18 && lat <= 54 && lng >= 73 && lng <= 135;
+    }
 
     (async () => {
       try {
@@ -536,34 +717,98 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
 
         setHasLocationPermission(true);
 
+        // ---- 第一步：获取初始位置（多级回退 + 中国坐标校验） ----
         let coords: UserLocation | null = null;
+
+        // 1a. 高精度 GPS（给 10 秒时间搜星）
         try {
           const loc = await withTimeout(
-            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-            GPS_TIMEOUT_MS,
+            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+            10000,
           );
-          coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-        } catch {
+          const lat = loc.coords.latitude;
+          const lng = loc.coords.longitude;
+          console.log('[Map] GPS 高精度:', lat.toFixed(6), lng.toFixed(6), '精度:', loc.coords.accuracy, '米');
+          if (isInChina(lat, lng)) {
+            coords = { latitude: lat, longitude: lng };
+          } else {
+            console.warn('[Map] GPS 坐标不在中国范围内，跳过:', lat, lng);
+          }
+        } catch (e) {
+          console.warn('[Map] GPS 高精度超时:', (e as Error).message);
+        }
+
+        // 1b. 平衡精度
+        if (!coords) {
           try {
             const loc = await withTimeout(
-              Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low }),
-              GPS_TIMEOUT_MS,
+              Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+              8000,
             );
-            coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-          } catch {
+            const lat = loc.coords.latitude;
+            const lng = loc.coords.longitude;
+            console.log('[Map] GPS 平衡精度:', lat.toFixed(6), lng.toFixed(6));
+            if (isInChina(lat, lng)) {
+              coords = { latitude: lat, longitude: lng };
+            }
+          } catch (e) {
+            console.warn('[Map] GPS 平衡精度超时:', (e as Error).message);
+          }
+        }
+
+        // 1c. 上次缓存（仅当坐标在中国范围内才使用）
+        if (!coords) {
+          try {
             const last = await Location.getLastKnownPositionAsync();
             if (last) {
-              coords = { latitude: last.coords.latitude, longitude: last.coords.longitude };
+              const lat = last.coords.latitude;
+              const lng = last.coords.longitude;
+              console.log('[Map] 缓存坐标:', lat.toFixed(6), lng.toFixed(6));
+              if (isInChina(lat, lng)) {
+                coords = { latitude: lat, longitude: lng };
+                console.log('[Map] 使用缓存坐标（在中国范围内）');
+              } else {
+                console.warn('[Map] 缓存坐标不在中国范围内，忽略:', lat, lng);
+              }
             }
-          }
+          } catch {}
+        }
+
+        // 1d. 全部失败 → 使用西安默认坐标（国内地图可见）
+        if (!coords) {
+          coords = { latitude: 34.2635, longitude: 108.948 };
+          console.log('[Map] 所有定位方式失败，使用西安默认坐标');
         }
 
         if (cancelled) return;
 
-        if (coords) {
-          setUserLocation(coords);
-        }
+        setUserLocation(coords);
         dismissLoadingOverlay();
+
+        // ---- 第二步：启动持续前台定位追踪 ----
+        watchSubscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.High,
+            distanceInterval: 3,
+            timeInterval: 2000,
+          },
+          (loc) => {
+            if (cancelled) return;
+            const lat = loc.coords.latitude;
+            const lng = loc.coords.longitude;
+            // 只接受中国范围内的坐标更新
+            if (!isInChina(lat, lng)) {
+              if (__DEV__) console.warn('[Map] watchPosition 坐标不在中国范围，忽略:', lat, lng);
+              return;
+            }
+            const newCoords: UserLocation = { latitude: lat, longitude: lng };
+            if (__DEV__) {
+              console.log('[Map] 位置更新:', lat.toFixed(6), lng.toFixed(6), '精度:', loc.coords.accuracy, '米');
+            }
+            setUserLocation(newCoords);
+          },
+        );
+        console.log('[Map] 持续定位追踪已启动');
       } catch (error) {
         if (!cancelled) {
           console.warn('获取定位失败:', error);
@@ -572,13 +817,24 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (watchSubscription) {
+        watchSubscription.remove();
+        console.log('[Map] 持续定位追踪已停止');
+      }
+    };
   }, [dismissLoadingOverlay]);
 
   // ---- Send user location to map when known (setView, not fitBounds) ----
   useEffect(() => {
     if (!mapReady || !userLocation) return;
     injectCall(webViewRef, 'window.setUserLocation', userLocation.latitude, userLocation.longitude);
+    // 延迟刷新视口，确保 setView 后瓦片正确加载
+    const timer = setTimeout(() => {
+      injectCall(webViewRef, 'window.refreshView');
+    }, 600);
+    return () => clearTimeout(timer);
   }, [userLocation, mapReady]);
 
   // ---- Foreground polling ----
@@ -615,6 +871,22 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           trailPathLengthRef.current += newPoints.length;
           exploreGridsBatch(newPoints);
         }
+
+        // ---- 队友动画：首次初始化 + 每秒位移更新 ----
+        const currentPath = useHikeStore.getState().currentPath;
+        if (currentPath.length >= 4 && !teammatesInitedRef.current) {
+          animatorRef.current.init(currentPath);
+          teammatesInitedRef.current = true;
+          const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
+          if (renderData.length > 0) {
+            injectCall(webViewRef, 'window.addTeammates', JSON.stringify(renderData));
+          }
+        } else if (teammatesInitedRef.current) {
+          const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
+          if (renderData.length > 0) {
+            injectCall(webViewRef, 'window.updateTeammates', JSON.stringify(renderData));
+          }
+        }
       }
     }, POLL_INTERVAL_MS);
 
@@ -636,7 +908,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       <WebView
         key="smarthike-leaflet-map"
         ref={webViewRef}
-        source={{ html: LEAFLET_HTML }}
+        source={{ html: LEAFLET_HTML, baseUrl: 'https://tile.openstreetmap.org' }}
         style={StyleSheet.absoluteFillObject}
         onMessage={handleWebViewMessage}
         javaScriptEnabled
@@ -648,6 +920,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
         overScrollMode="never"
         originWhitelist={['*']}
         setSupportMultipleWindows={false}
+        mixedContentMode="always"
       />
 
       {/* GPS Loading Overlay */}

@@ -333,6 +333,17 @@ interface HikeStoreState {
   /** 清空 AI 对话记录 */
   clearAiMessages: () => void;
 
+  // ---- 约伴匹配 UI 状态 ----
+
+  /** 智能匹配全屏动画是否可见 */
+  isMatchVisible: boolean;
+
+  /** 显示匹配动画 */
+  showMatch: () => void;
+
+  /** 关闭匹配动画 */
+  hideMatch: () => void;
+
   // ---- 体征历史（滑动窗口） ----
 
   /** 最近 30 个数据点的体征历史 */
@@ -415,6 +426,7 @@ export const useHikeStore = create<HikeStoreState>()(
       isTabBarVisible: true,
       accountState: DEFAULT_ACCOUNT_STATE,
       aiMessages: [],
+      isMatchVisible: false,
       biometricsHistory: [],
 
       // ---- Actions 实现 ----
@@ -722,6 +734,14 @@ export const useHikeStore = create<HikeStoreState>()(
 
       clearAiMessages: () => {
         set({ aiMessages: [] });
+      },
+
+      showMatch: () => {
+        set({ isMatchVisible: true });
+      },
+
+      hideMatch: () => {
+        set({ isMatchVisible: false });
       },
     }),
     {
