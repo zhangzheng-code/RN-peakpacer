@@ -57,7 +57,7 @@ export default function FloatingButtons({
         }}
       >
         <Text style={{ fontSize: 18 }}>
-          {activeSource === 'standard' ? '🛰️' : '🗺️'}
+          {activeSource === 'standard' ? '🛰️' : activeSource === 'satellite' ? '⛰️' : '🗺️'}
         </Text>
       </TouchableOpacity>
 

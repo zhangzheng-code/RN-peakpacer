@@ -25,6 +25,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useHikeStore } from '../store/useHikeStore';
+import { useLoginGate } from '../hooks/useLoginGate';
 import {
   sendStreamingChat,
   setDeepSeekApiKey,
@@ -219,6 +220,8 @@ export default function AIChatScreen({ visible, onClose }: AIChatScreenProps) {
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [needsApiKey, setNeedsApiKey] = useState(true);
 
+  const { requireLogin } = useLoginGate();
+
   /** 检查 API Key 是否已设置 */
   useEffect(() => {
     if (visible) {
@@ -268,6 +271,7 @@ export default function AIChatScreen({ visible, onClose }: AIChatScreenProps) {
 
   /** 发送消息 */
   const handleSend = useCallback(async () => {
+    if (!requireLogin('AI 对话')) return;
     const userText = inputText.trim();
     if (!userText || isLoading) return;
 
@@ -346,10 +350,11 @@ export default function AIChatScreen({ visible, onClose }: AIChatScreenProps) {
       setIsLoading(false);
       abortControllerRef.current = null;
     }
-  }, [inputText, isLoading, environmentContext, updateMessage]);
+  }, [inputText, isLoading, environmentContext, updateMessage, requireLogin]);
 
   /** 清空对话 */
   const handleClearChat = useCallback(() => {
+    if (!requireLogin('清空对话')) return;
     Alert.alert('清空对话', '确定要清空所有对话记录吗？', [
       { text: '取消', style: 'cancel' },
       {
@@ -358,7 +363,7 @@ export default function AIChatScreen({ visible, onClose }: AIChatScreenProps) {
         onPress: () => clearChatMessages(),
       },
     ]);
-  }, [clearChatMessages]);
+  }, [clearChatMessages, requireLogin]);
 
   if (!visible) return null;
 

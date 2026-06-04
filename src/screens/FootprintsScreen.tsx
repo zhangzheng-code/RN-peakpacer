@@ -11,7 +11,7 @@
  */
 
 import React, { useMemo, useCallback } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Image, Pressable, Alert } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FlashList } from '@shopify/flash-list';
 import Svg, { Circle } from 'react-native-svg';
@@ -19,6 +19,7 @@ import * as Haptics from 'expo-haptics';
 import { useNavigation } from '@react-navigation/native';
 import { useHikeStore } from '../store/useHikeStore';
 import { useShallow } from 'zustand/shallow';
+import LoginModal from '../components/LoginModal';
 import type { HistoryTrack } from '../types';
 
 // ============================================================
@@ -180,9 +181,9 @@ const capsuleStyles = StyleSheet.create({
 });
 
 /** 历史轨迹卡片 */
-function TrackCard({ track, onPress }: { track: HistoryTrack; onPress: () => void }) {
+function TrackCard({ track, onPress, onLongPress }: { track: HistoryTrack; onPress: () => void; onLongPress: () => void }) {
   return (
-    <TouchableOpacity onPress={onPress} activeOpacity={0.7} style={trackStyles.card}>
+    <TouchableOpacity onPress={onPress} onLongPress={onLongPress} activeOpacity={0.7} delayLongPress={500} style={trackStyles.card}>
       <View style={trackStyles.topRow}>
         <View style={trackStyles.dot} />
         <Text style={trackStyles.date}>{formatDate(track.startTime)}</Text>
@@ -252,6 +253,12 @@ export default function FootprintsScreen() {
   const exploredGrids = useHikeStore(useShallow((s) => s.exploredGrids));
   const historyTracks = useHikeStore(useShallow((s) => s.historyTracks));
   const importRoutePath = useHikeStore((s) => s.importRoutePath);
+  const accountState = useHikeStore((s) => s.accountState);
+  const isLoginModalVisible = useHikeStore((s) => s.isLoginModalVisible);
+  const showLoginModal = useHikeStore((s) => s.showLoginModal);
+  const hideLoginModal = useHikeStore((s) => s.hideLoginModal);
+  const deleteHistoryTrack = useHikeStore((s) => s.deleteHistoryTrack);
+  const logout = useHikeStore((s) => s.logout);
 
   // ---- 派生统计数据 ----
   const stats = useMemo(() => {
@@ -277,12 +284,53 @@ export default function FootprintsScreen() {
     [navigation, importRoutePath],
   );
 
+  // ---- 长按删除历史轨迹 ----
+  const handleTrackLongPress = useCallback(
+    (track: HistoryTrack) => {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      Alert.alert(
+        '删除徒步记录',
+        `确定要删除 ${formatDate(track.startTime)} 的徒步记录吗？此操作不可撤销。`,
+        [
+          { text: '取消', style: 'cancel' },
+          {
+            text: '删除',
+            style: 'destructive',
+            onPress: () => deleteHistoryTrack(track.id),
+          },
+        ],
+      );
+    },
+    [deleteHistoryTrack],
+  );
+
+  // ---- 退出登录 ----
+  const handleLogout = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    Alert.alert(
+      '退出登录',
+      '确定要退出当前账号吗？',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '退出',
+          style: 'destructive',
+          onPress: logout,
+        },
+      ],
+    );
+  }, [logout]);
+
   // ---- FlashList 渲染 ----
   const renderTrack = useCallback(
     ({ item }: { item: HistoryTrack }) => (
-      <TrackCard track={item} onPress={() => handleTrackPress(item)} />
+      <TrackCard
+        track={item}
+        onPress={() => handleTrackPress(item)}
+        onLongPress={() => handleTrackLongPress(item)}
+      />
     ),
-    [handleTrackPress],
+    [handleTrackPress, handleTrackLongPress],
   );
 
   const trackKeyExtractor = useCallback((item: HistoryTrack) => item.id, []);
@@ -299,12 +347,67 @@ export default function FootprintsScreen() {
     [],
   );
 
+  // ============================================================
+  // 未登录 → 全屏登录引导
+  // ============================================================
+  if (!accountState.isLoggedIn) {
+    return (
+      <View style={[styles.root, { paddingTop: insets.top }]}>
+        <View style={styles.gateContainer}>
+          <Text style={styles.gateIcon}>🏔️</Text>
+          <Text style={styles.gateTitle}>探索你的山野足迹</Text>
+          <Text style={styles.gateSub}>
+            登录后即可查看个人徒步档案、{'\n'}探索进度与历史轨迹
+          </Text>
+          <Pressable
+            style={styles.gateBtn}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              showLoginModal();
+            }}
+          >
+            <Text style={styles.gateBtnText}>立即登录</Text>
+          </Pressable>
+        </View>
+        <LoginModal visible={isLoginModalVisible} onClose={hideLoginModal} />
+      </View>
+    );
+  }
+
+  // ============================================================
+  // 已登录 → 完整足迹档案
+  // ============================================================
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Footprints</Text>
-        <Text style={styles.headerSub}>你的山野足迹档案</Text>
+        <View style={styles.headerRow}>
+          <View style={styles.headerLeft}>
+            <Text style={styles.headerTitle}>Footprints</Text>
+            <Text style={styles.headerSub}>你的山野足迹档案</Text>
+          </View>
+
+          {/* 用户头像 + 退出登录 */}
+          <Pressable style={styles.userBadge} onPress={handleLogout}>
+            <View style={styles.avatarWrap}>
+              {accountState.user?.avatarUrl ? (
+                <Image
+                  source={{ uri: accountState.user.avatarUrl }}
+                  style={styles.avatar}
+                />
+              ) : (
+                <View style={styles.avatarFallback}>
+                  <Text style={styles.avatarFallbackText}>
+                    {accountState.user?.nickname?.charAt(0) || '?'}
+                  </Text>
+                </View>
+              )}
+            </View>
+            <Text style={styles.userNickname} numberOfLines={1}>
+              {accountState.user?.nickname || '徒步者'}
+            </Text>
+          </Pressable>
+        </View>
       </View>
 
       {/* Stats Dashboard */}
@@ -379,6 +482,66 @@ const styles = StyleSheet.create({
     color: C.textMuted,
     marginTop: 2,
   },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  headerLeft: {
+    flex: 1,
+  },
+  userBadge: {
+    alignItems: 'center',
+    gap: 4,
+  },
+  avatarWrap: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: C.accent,
+  },
+  avatar: {
+    width: '100%',
+    height: '100%',
+  },
+  avatarFallback: {
+    flex: 1,
+    backgroundColor: C.accentDim,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarFallbackText: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: C.accent,
+  },
+  userNickname: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: C.textSecondary,
+    maxWidth: 56,
+    textAlign: 'center',
+  },
+  loginPrompt: {
+    alignItems: 'center',
+    gap: 2,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 14,
+    backgroundColor: C.card,
+    borderWidth: 1,
+    borderColor: C.cardBorder,
+  },
+  loginPromptIcon: {
+    fontSize: 20,
+  },
+  loginPromptText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: C.accent,
+  },
   dashboard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -423,5 +586,43 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: C.textMuted,
     marginTop: 4,
+  },
+  // ---- 未登录全屏引导 ----
+  gateContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+    paddingBottom: 80,
+  },
+  gateIcon: {
+    fontSize: 64,
+    marginBottom: 20,
+  },
+  gateTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: C.textPrimary,
+    letterSpacing: -0.5,
+    marginBottom: 10,
+  },
+  gateSub: {
+    fontSize: 14,
+    color: C.textMuted,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: 28,
+  },
+  gateBtn: {
+    paddingHorizontal: 40,
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: C.accent,
+  },
+  gateBtnText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#fff',
+    letterSpacing: 1,
   },
 });

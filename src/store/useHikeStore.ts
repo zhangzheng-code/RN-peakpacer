@@ -167,6 +167,13 @@ interface HikeStoreState {
   /** 累计海拔上升（米） */
   elevationGain: number;
 
+  /**
+   * 是否有外部导入的路线正在显示
+   * - true: drawTrack fitBounds 驱动地图中心，GPS 只更新蓝点不抢中心
+   * - false: GPS 驱动地图中心
+   */
+  isRouteActive: boolean;
+
   // ---- 历史轨迹 ----
 
   /** 历史轨迹记录列表 */
@@ -304,15 +311,35 @@ interface HikeStoreState {
   /** 设置 Tab 栏可见性 */
   setTabBarVisible: (visible: boolean) => void;
 
+  // ---- 战报 UI 状态 ----
+
+  /** 运动战报是否可见 */
+  isSummaryVisible: boolean;
+
+  /** 显示战报 */
+  showSummary: () => void;
+
+  /** 关闭战报 */
+  dismissSummary: () => void;
+
   // ---- 账户状态 ----
 
   /** 账户登录状态 */
   accountState: AccountState;
 
+  /** 登录弹窗是否可见 */
+  isLoginModalVisible: boolean;
+
+  /** 显示登录弹窗 */
+  showLoginModal: () => void;
+
+  /** 关闭登录弹窗 */
+  hideLoginModal: () => void;
+
   /**
    * Mock 登录
    * 模拟 POST /api/users/login
-   * 验证码固定为 '123456'，手机号匹配 MOCK_USERS 数据库
+   * 验证码固定为 '8848'，手机号匹配 MOCK_USERS 数据库
    */
   login: (params: LoginParams) => Promise<boolean>;
 
@@ -412,6 +439,7 @@ export const useHikeStore = create<HikeStoreState>()(
       startTime: null,
       totalDistance: 0,
       elevationGain: 0,
+      isRouteActive: false,
       historyTracks: [],
       profile: DEFAULT_PROFILE,
       biometrics: DEFAULT_BIOMETRICS,
@@ -427,6 +455,8 @@ export const useHikeStore = create<HikeStoreState>()(
       accountState: DEFAULT_ACCOUNT_STATE,
       aiMessages: [],
       isMatchVisible: false,
+      isSummaryVisible: false,
+      isLoginModalVisible: false,
       biometricsHistory: [],
 
       // ---- Actions 实现 ----
@@ -435,6 +465,7 @@ export const useHikeStore = create<HikeStoreState>()(
         set({
           hikeStatus: 'recording',
           currentPath: [],
+          isRouteActive: false,
           startTime: Date.now(),
           totalDistance: 0,
           elevationGain: 0,
@@ -458,6 +489,7 @@ export const useHikeStore = create<HikeStoreState>()(
           set((prev) => ({
             hikeStatus: 'idle',
             startTime: null,
+            isRouteActive: false,
             historyTracks: [...prev.historyTracks, track],
             consecutiveAlertCount: 0,
             isAlertActive: false,
@@ -466,6 +498,7 @@ export const useHikeStore = create<HikeStoreState>()(
           set({
             hikeStatus: 'idle',
             startTime: null,
+            isRouteActive: false,
             consecutiveAlertCount: 0,
             isAlertActive: false,
           });
@@ -638,14 +671,26 @@ export const useHikeStore = create<HikeStoreState>()(
       },
 
       importRoutePath: (path) => {
+        if (!path || path.length === 0) return;
+        // 坐标校验：至少第一个点应在中国范围内
+        const first = path[0];
+        const inChina = first.latitude >= 18 && first.latitude <= 54 &&
+                        first.longitude >= 73 && first.longitude <= 135;
+        if (!inChina) {
+          console.warn('[Store] importRoutePath: 坐标不在中国范围内，拒绝导入', first);
+          return;
+        }
         const trailPoints: TrailPoint[] = path.map((p) => ({
           latitude: p.latitude,
           longitude: p.longitude,
           timestamp: Date.now(),
         }));
+        // 把路线途经的网格标记为已探索，避免迷雾覆盖层遮挡路线
+        get().exploreGridsBatch(trailPoints);
         set({
           currentPath: trailPoints,
           hikeStatus: 'recording',
+          isRouteActive: true,
           startTime: Date.now(),
           totalDistance: 0,
           elevationGain: 0,
@@ -666,12 +711,12 @@ export const useHikeStore = create<HikeStoreState>()(
         await new Promise((resolve) => setTimeout(resolve, delay));
 
         // 验证码校验
-        if (params.code !== '123456') {
+        if (params.code !== '8848') {
           set((prev) => ({
             accountState: {
               ...prev.accountState,
               isLoading: false,
-              error: '验证码错误，请输入 123456',
+              error: '验证码错误，请输入 8848',
             },
           }));
           return false;
@@ -742,6 +787,22 @@ export const useHikeStore = create<HikeStoreState>()(
 
       hideMatch: () => {
         set({ isMatchVisible: false });
+      },
+
+      showSummary: () => {
+        set({ isSummaryVisible: true });
+      },
+
+      dismissSummary: () => {
+        set({ isSummaryVisible: false });
+      },
+
+      showLoginModal: () => {
+        set({ isLoginModalVisible: true });
+      },
+
+      hideLoginModal: () => {
+        set({ isLoginModalVisible: false });
       },
     }),
     {

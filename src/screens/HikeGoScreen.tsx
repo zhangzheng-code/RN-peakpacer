@@ -18,8 +18,10 @@ import StatsHUD from '../components/StatsHUD';
 import PEIOrb from '../components/PEIOrb';
 import FloatingButtons from '../components/FloatingButtons';
 import SafetyAlert from '../components/SafetyAlert';
+import HikeSummaryModal from '../components/HikeSummaryModal';
 import AIChatScreen from './AIChatScreen';
 import { useHikeStore } from '../store/useHikeStore';
+import { useLoginGate } from '../hooks/useLoginGate';
 import { calculatePEI, getPEIColor, getPEILabel } from '../utils/healthCalculator';
 import { startHealthDataStream, stopHealthDataStream } from '../services/healthService';
 import {
@@ -45,10 +47,13 @@ export default function HikeGoScreen() {
   const setTabBarVisible = useHikeStore((s) => s.setTabBarVisible);
   const storeStartHike = useHikeStore((s) => s.startHike);
   const storeStopHike = useHikeStore((s) => s.stopHike);
+  const showSummary = useHikeStore((s) => s.showSummary);
   const updateBiometrics = useHikeStore((s) => s.updateBiometrics);
   const addBiometricsRecord = useHikeStore((s) => s.addBiometricsRecord);
   const biometricsHistory = useHikeStore((s) => s.biometricsHistory);
   const clearBiometricsHistory = useHikeStore((s) => s.clearBiometricsHistory);
+
+  const { requireLogin } = useLoginGate();
 
   const isRecording = hikeStatus === 'recording';
 
@@ -140,6 +145,8 @@ export default function HikeGoScreen() {
 
   // ---- Start hike (with background location) ----
   const handleStartHike = useCallback(async () => {
+    if (!requireLogin('开始徒步')) return;
+
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
     resetTrailBuffer();
@@ -151,7 +158,7 @@ export default function HikeGoScreen() {
         { text: '知道了' },
       ]);
     }
-  }, [storeStartHike]);
+  }, [storeStartHike, requireLogin]);
 
   // ---- Stop hike (with background location) ----
   const handleStopHike = useCallback(async () => {
@@ -164,17 +171,23 @@ export default function HikeGoScreen() {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
           await stopBackgroundLocation();
           storeStopHike();
+          showSummary();
         },
       },
     ]);
-  }, [storeStopHike]);
+  }, [storeStopHike, showSummary]);
 
   // ---- Floating button handlers ----
   const handleSwitchSource = useCallback(() => {
-    setActiveSource((prev) => (prev === 'standard' ? 'satellite' : 'standard'));
+    setActiveSource((prev) =>
+      prev === 'standard' ? 'satellite' : prev === 'satellite' ? 'topo' : 'standard'
+    );
   }, []);
 
-  const handleOpenAI = useCallback(() => setIsAIChatVisible(true), []);
+  const handleOpenAI = useCallback(() => {
+    if (!requireLogin('AI 对讲')) return;
+    setIsAIChatVisible(true);
+  }, [requireLogin]);
   const handleCloseAI = useCallback(() => setIsAIChatVisible(false), []);
 
   // ---- Sheet header animated style (fade + translate on expand) ----
@@ -349,6 +362,9 @@ export default function HikeGoScreen() {
 
       {/* SafetyAlert modal */}
       <SafetyAlert />
+
+      {/* Hike Summary modal */}
+      <HikeSummaryModal />
 
       {/* AI Chat fullscreen modal */}
       <Modal

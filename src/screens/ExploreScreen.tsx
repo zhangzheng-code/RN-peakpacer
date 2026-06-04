@@ -22,6 +22,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import { useHikeStore } from '../store/useHikeStore';
+import { useLoginGate } from '../hooks/useLoginGate';
 
 // ---- Types ----
 
@@ -208,16 +209,18 @@ export default function ExploreScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
   const importRoutePath = useHikeStore((s) => s.importRoutePath);
+  const { requireLogin } = useLoginGate();
 
   const handleImportRoute = useCallback(
     (route: TrailRoute) => {
+      if (!requireLogin('导入路线')) return;
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       importRoutePath(route.path);
       setTimeout(() => {
         navigation.navigate('HikeGo' as never);
       }, 150);
     },
-    [importRoutePath, navigation],
+    [importRoutePath, navigation, requireLogin],
   );
 
   const renderRouteCard = useCallback(

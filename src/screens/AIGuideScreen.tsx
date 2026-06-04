@@ -40,6 +40,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import { useNavigation } from "@react-navigation/native";
 import { useHikeStore, type HazardAlertType } from "../store/useHikeStore";
+import { useLoginGate } from "../hooks/useLoginGate";
 import {
   calculatePEI,
   getPEIColor,
@@ -953,6 +954,8 @@ export default function AIGuideScreen() {
   const [inputText, setInputText] = useState("");
   const [isStreaming, setStreaming] = useState(false);
 
+  const { requireLogin } = useLoginGate();
+
   // ---- Debug Panel 隐藏触发 ----
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const clickCountRef = useRef(0);
@@ -1002,6 +1005,7 @@ export default function AIGuideScreen() {
 
   const handleEquipCardPress = useCallback(
     (hazardType: Exclude<HazardAlertType, null>) => {
+      if (!requireLogin('装备租借')) return;
       const config = JIT_EQUIP_MAP[hazardType];
 
       // 1. Haptic 确认震动
@@ -1013,7 +1017,7 @@ export default function AIGuideScreen() {
       // 3. 跨页跳转到地图页面，自动展示路线
       (navigation as any).navigate("HikeGo");
     },
-    [navigation, importRoutePath],
+    [navigation, importRoutePath, requireLogin],
   );
 
   // ---- 悬浮输入栏的 bottom 值 ----
@@ -1033,6 +1037,7 @@ export default function AIGuideScreen() {
   // ---- 核心：发送消息并流式接收 ----
   const handleSend = useCallback(
     async (text: string) => {
+      if (!requireLogin('AI 对话')) return;
       const trimmed = text.trim();
       if (!trimmed || isStreaming) return;
 
@@ -1121,6 +1126,7 @@ export default function AIGuideScreen() {
       peiLabel,
       weather,
       scrollToBottom,
+      requireLogin,
     ],
   );
 

@@ -54,6 +54,9 @@ const ESRI_SATELLITE_URL =
 // 卫星备用：高德
 const AMAP_SATELLITE_URL =
   'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}';
+// 等高线地形图：OpenTopoMap
+const TOPO_URL =
+  'https://a.tile.opentopomap.org/{z}/{x}/{y}.png';
 
 const POLL_INTERVAL_MS = 1000;
 const RDP_EPSILON = 10;
@@ -155,6 +158,9 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       var satelliteTile = createTileLayer('${ESRI_SATELLITE_URL}');
 
       var currentTileType = 'standard';
+
+      // 等高线地形图
+      var topoTile = createTileLayer('${TOPO_URL}', { maxZoom: 17 });
 
       // 回退瓦片源（主力加载失败时自动切换）
       var amapStandardTile = createTileLayer('${AMAP_STANDARD_URL}');
@@ -259,52 +265,195 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       // 全局 API：RN 端通过 injectJavaScript 调用以下函数
       // ================================================================
 
+      // ---- 路线渲染状态 ----
+      var trailSegments = [];       // 渐变色分段 polyline 数组
+      var trailOutline = null;      // 路线描边 polyline
+      var startMarker = null;       // 起点标记
+      var endMarker = null;         // 终点标记
+      var directionArrows = [];     // 方向箭头标记数组
+
       /**
-       * 绘制/更新轨迹线
+       * 海拔→颜色插值（绿→黄→红）
+       */
+      function elevationColor(alt, minAlt, maxAlt) {
+        if (maxAlt <= minAlt) return '#10B981';
+        var t = Math.max(0, Math.min(1, (alt - minAlt) / (maxAlt - minAlt)));
+        // 绿 #10B981 → 黄 #F59E0B → 红 #EF4444
+        var r, g, b;
+        if (t < 0.5) {
+          var t2 = t * 2;
+          r = Math.round(16 + (245 - 16) * t2);
+          g = Math.round(185 + (158 - 185) * t2);
+          b = Math.round(129 + (11 - 129) * t2);
+        } else {
+          var t2 = (t - 0.5) * 2;
+          r = Math.round(245 + (239 - 245) * t2);
+          g = Math.round(158 + (68 - 158) * t2);
+          b = Math.round(11 + (68 - 11) * t2);
+        }
+        return 'rgb(' + r + ',' + g + ',' + b + ')';
+      }
+
+      /**
+       * 清除旧路线元素
+       */
+      function clearTrack() {
+        var i;
+        for (i = 0; i < trailSegments.length; i++) {
+          map.removeLayer(trailSegments[i]);
+        }
+        trailSegments = [];
+        if (trailOutline) { map.removeLayer(trailOutline); trailOutline = null; }
+        if (trailPolyline) { map.removeLayer(trailPolyline); trailPolyline = null; }
+        if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
+        if (endMarker) { map.removeLayer(endMarker); endMarker = null; }
+        for (i = 0; i < directionArrows.length; i++) {
+          map.removeLayer(directionArrows[i]);
+        }
+        directionArrows = [];
+      }
+
+      /**
+       * 绘制/更新轨迹线（渐变色 + 起终点 + 方向箭头）
        *
-       * 核心修复：
-       * - points.length === 1 → setView（单点降级，绝不 fitBounds）
-       * - points.length >= 2 → setLatLngs + fitBounds（maxZoom 兜底）
-       * - points.length === 0 → 不做任何操作
+       * @param {string} pointsJson - JSON 数组，每个元素 [lat, lng] 或 [lat, lng, altitude]
        */
       window.drawTrack = function(pointsJson) {
         try {
           var points = JSON.parse(pointsJson);
           if (!points || points.length === 0) return;
 
+          clearTrack();
+
           if (points.length === 1) {
-            // ---- 单点降级：setView，保持高清缩放 ----
+            // ---- 单点降级 ----
             var pt = points[0];
-            if (trailPolyline) {
-              trailPolyline.setLatLngs([pt]);
-            } else {
-              trailPolyline = L.polyline([pt], {
-                color: '${TRAIL_COLOR}',
-                weight: ${TRAIL_WEIGHT},
-                lineCap: 'round',
-                lineJoin: 'round',
-                smoothFactor: 1,
-              }).addTo(map);
-            }
-            // 绝不 fitBounds 单点！使用 setView 保持稳定缩放
+            trailPolyline = L.polyline([pt], {
+              color: '#10B981',
+              weight: 5,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }).addTo(map);
+            // 起点标记
+            startMarker = L.marker(pt, {
+              icon: L.divIcon({
+                className: 'track-marker',
+                html: '<div style="width:28px;height:28px;border-radius:50%;background:#10B981;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;box-shadow:0 2px 8px rgba(16,185,129,0.5);border:2px solid rgba(255,255,255,0.8);">S</div>',
+                iconSize: [28, 28],
+                iconAnchor: [14, 14],
+              }),
+              interactive: false,
+            }).addTo(map);
             map.setView(pt, 16, { animate: true, duration: 0.5 });
             return;
           }
 
-          // ---- 多点：原地更新 + fitBounds 兜底 ----
-          if (trailPolyline) {
-            trailPolyline.setLatLngs(points);
-          } else {
-            trailPolyline = L.polyline(points, {
-              color: '${TRAIL_COLOR}',
-              weight: ${TRAIL_WEIGHT},
-              lineCap: 'round',
-              lineJoin: 'round',
-              smoothFactor: 1,
-            }).addTo(map);
+          // ---- 多点渐变路线 ----
+          // 提取海拔数据（如果有）
+          var hasAltitude = points[0].length >= 3 && points[0][2] != null;
+          var minAlt = Infinity, maxAlt = -Infinity;
+          var i;
+
+          if (hasAltitude) {
+            for (i = 0; i < points.length; i++) {
+              if (points[i][2] < minAlt) minAlt = points[i][2];
+              if (points[i][2] > maxAlt) maxAlt = points[i][2];
+            }
           }
 
-          // fitBounds 兜底：maxZoom:16 防止过度缩放
+          // 描边（底层，营造立体感）
+          trailOutline = L.polyline(points, {
+            color: 'rgba(0,0,0,0.35)',
+            weight: 9,
+            lineCap: 'round',
+            lineJoin: 'round',
+            smoothFactor: 1,
+          }).addTo(map);
+
+          // 渐变分段
+          if (hasAltitude && maxAlt > minAlt) {
+            var segLen = Math.max(2, Math.floor(points.length / 30)); // 约 30 段
+            for (i = 0; i < points.length - 1; i += segLen) {
+              var end = Math.min(i + segLen + 1, points.length);
+              var segPoints = points.slice(i, end);
+              var midAlt = (points[i][2] + points[end - 1][2]) / 2;
+              var seg = L.polyline(segPoints, {
+                color: elevationColor(midAlt, minAlt, maxAlt),
+                weight: 5,
+                lineCap: 'round',
+                lineJoin: 'round',
+                smoothFactor: 1,
+              }).addTo(map);
+              trailSegments.push(seg);
+            }
+          } else {
+            // 无海拔数据：使用单色渐变（从头到尾颜色渐变）
+            var segLen2 = Math.max(2, Math.floor(points.length / 30));
+            for (i = 0; i < points.length - 1; i += segLen2) {
+              var end2 = Math.min(i + segLen2 + 1, points.length);
+              var t = i / (points.length - 1);
+              var segPoints2 = points.slice(i, end2);
+              var seg2 = L.polyline(segPoints2, {
+                color: elevationColor(t * 100, 0, 100),
+                weight: 5,
+                lineCap: 'round',
+                lineJoin: 'round',
+                smoothFactor: 1,
+              }).addTo(map);
+              trailSegments.push(seg2);
+            }
+          }
+
+          // ---- 起点标记（绿色 S）----
+          startMarker = L.marker(points[0], {
+            icon: L.divIcon({
+              className: 'track-marker',
+              html: '<div style="width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#10B981,#059669);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:#fff;box-shadow:0 3px 12px rgba(16,185,129,0.6);border:2.5px solid rgba(255,255,255,0.9);">S</div>',
+              iconSize: [30, 30],
+              iconAnchor: [15, 15],
+            }),
+            interactive: false,
+          }).addTo(map);
+
+          // ---- 终点标记（红色 E）----
+          endMarker = L.marker(points[points.length - 1], {
+            icon: L.divIcon({
+              className: 'track-marker',
+              html: '<div style="width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#EF4444,#DC2626);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:#fff;box-shadow:0 3px 12px rgba(239,68,68,0.6);border:2.5px solid rgba(255,255,255,0.9);">E</div>',
+              iconSize: [30, 30],
+              iconAnchor: [15, 15],
+            }),
+            interactive: false,
+          }).addTo(map);
+
+          // ---- 方向箭头（每隔 ~500m 一个小三角）----
+          // 估算总距离（粗略，用经纬度差）
+          var totalDist = 0;
+          for (i = 1; i < points.length; i++) {
+            var dlat = points[i][0] - points[i-1][0];
+            var dlng = points[i][1] - points[i-1][1];
+            totalDist += Math.sqrt(dlat * dlat + dlng * dlng);
+          }
+          var arrowInterval = Math.max(3, Math.floor(points.length * (0.003 / Math.max(totalDist, 0.001))));
+          arrowInterval = Math.min(arrowInterval, Math.floor(points.length / 3));
+
+          for (i = arrowInterval; i < points.length - 1; i += arrowInterval) {
+            var p1 = points[i - 1];
+            var p2 = points[i];
+            var angle = Math.atan2(p2[1] - p1[1], p2[0] - p1[0]) * 180 / Math.PI;
+            var arrow = L.marker(points[i], {
+              icon: L.divIcon({
+                className: 'direction-arrow',
+                html: '<div style="width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:8px solid rgba(255,255,255,0.7);transform:rotate(' + (90 - angle) + 'deg);"></div>',
+                iconSize: [10, 8],
+                iconAnchor: [5, 4],
+              }),
+              interactive: false,
+            }).addTo(map);
+            directionArrows.push(arrow);
+          }
+
+          // fitBounds
           var bounds = L.latLngBounds(points);
           if (bounds.isValid()) {
             map.fitBounds(bounds, {
@@ -342,12 +491,18 @@ const LEAFLET_HTML = `<!DOCTYPE html>
        */
       window.setTileSource = function(source) {
         try {
-          if (source === 'satellite' && currentTileType !== 'satellite') {
-            map.removeLayer(standardTile);
+          // 移除当前图层
+          if (currentTileType === 'standard') map.removeLayer(standardTile);
+          else if (currentTileType === 'satellite') map.removeLayer(satelliteTile);
+          else if (currentTileType === 'topo') map.removeLayer(topoTile);
+
+          if (source === 'satellite') {
             satelliteTile.addTo(map);
             currentTileType = 'satellite';
-          } else if (source === 'standard' && currentTileType !== 'standard') {
-            map.removeLayer(satelliteTile);
+          } else if (source === 'topo') {
+            topoTile.addTo(map);
+            currentTileType = 'topo';
+          } else {
             standardTile.addTo(map);
             currentTileType = 'standard';
           }
@@ -382,10 +537,11 @@ const LEAFLET_HTML = `<!DOCTYPE html>
 
       /**
        * 设置/更新用户位置标记
-       * - 首次调用：创建标记 + 自动居中
-       * - 后续调用：更新标记位置 + 仅在跟随模式下居中
+       * @param {number} lat
+       * @param {number} lng
+       * @param {boolean} [recenter=true] - 是否自动居中（有路线时传 false）
        */
-      window.setUserLocation = function(lat, lng) {
+      window.setUserLocation = function(lat, lng, recenter) {
         try {
           var latlng = [lat, lng];
           var isFirst = !userMarker;
@@ -412,8 +568,9 @@ const LEAFLET_HTML = `<!DOCTYPE html>
               opacity: 0.4,
             }).addTo(map);
           }
-          // 首次定位或跟随模式 → 自动居中
-          if (isFirst || followMode) {
+          // 首次定位或跟随模式且无路线 → 自动居中
+          var shouldRecenter = recenter !== false && (isFirst || followMode);
+          if (shouldRecenter) {
             map.setView(latlng, 16, { animate: true, duration: 0.5 });
           }
         } catch (e) {}
@@ -437,6 +594,15 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       var teammateMarkers = {};
 
       /**
+       * 心率→颜色（绿/黄/红 区间）
+       */
+      function hrColor(hr) {
+        if (hr < 100) return '#10B981';
+        if (hr < 140) return '#F59E0B';
+        return '#EF4444';
+      }
+
+      /**
        * 初始化队友标记（首次调用）
        */
       window.addTeammates = function(teammatesJson) {
@@ -445,18 +611,26 @@ const LEAFLET_HTML = `<!DOCTYPE html>
           for (var i = 0; i < teammates.length; i++) {
             var t = teammates[i];
             if (teammateMarkers[t.id]) continue;
+            var hColor = hrColor(t.heartRate);
+            var statusIcon = t.isResting ? '🌙' : '🏃';
             var icon = L.divIcon({
               className: 'tm-container',
-              html: '<div style="position:relative;width:48px;height:64px;">' +
-                    '<div style="position:absolute;width:52px;height:52px;top:0;left:-2px;border-radius:50%;border:2px solid ' + t.color + ';opacity:0.3;animation:tm-pulse 2s ease-in-out infinite;"></div>' +
-                    '<div style="position:absolute;width:36px;height:36px;top:8px;left:6px;border-radius:50%;background:' + t.color + ';display:flex;align-items:center;justify-content:center;border:2px solid rgba(255,255,255,0.3);box-shadow:0 2px 12px rgba(0,0,0,0.5);">' +
-                    '<span style="font-size:18px;">' + t.emoji + '</span></div>' +
-                    '<div style="position:absolute;top:-6px;right:-18px;background:rgba(0,0,0,0.75);border-radius:10px;padding:2px 6px;display:flex;align-items:center;gap:2px;">' +
-                    '<span style="color:#EF4444;font-size:8px;">♥</span>' +
-                    '<span class="tm-hr-val" style="color:#fff;font-size:10px;font-weight:700;">' + t.heartRate + '</span></div>' +
-                    '<div style="position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);font-size:9px;color:rgba(255,255,255,0.5);white-space:nowrap;">' + t.name + '</div></div>',
-              iconSize: [48, 64],
-              iconAnchor: [24, 32],
+              html: '<div style="position:relative;width:56px;height:72px;">' +
+                    // 脉冲光环
+                    '<div style="position:absolute;width:56px;height:56px;top:0;left:0;border-radius:50%;border:2px solid ' + t.color + ';opacity:0.25;animation:tm-pulse 2s ease-in-out infinite;"></div>' +
+                    // 主头像圆
+                    '<div style="position:absolute;width:38px;height:38px;top:9px;left:9px;border-radius:50%;background:' + t.color + ';display:flex;align-items:center;justify-content:center;border:2.5px solid rgba(255,255,255,0.35);box-shadow:0 3px 14px rgba(0,0,0,0.5);">' +
+                    '<span style="font-size:19px;">' + t.emoji + '</span></div>' +
+                    // 状态指示（右下角）
+                    '<div class="tm-status" style="position:absolute;bottom:14px;right:-2px;font-size:11px;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.5));">' + statusIcon + '</div>' +
+                    // 心率徽章（右上角，颜色随心率变化）
+                    '<div style="position:absolute;top:-4px;right:-20px;background:rgba(0,0,0,0.82);border-radius:10px;padding:2px 7px;display:flex;align-items:center;gap:3px;border:1px solid ' + hColor + '40;">' +
+                    '<span style="color:' + hColor + ';font-size:8px;">♥</span>' +
+                    '<span class="tm-hr-val" style="color:' + hColor + ';font-size:10px;font-weight:700;">' + t.heartRate + '</span></div>' +
+                    // 名字标签
+                    '<div style="position:absolute;bottom:-2px;left:50%;transform:translateX(-50%);font-size:9px;font-weight:600;color:rgba(255,255,255,0.6);white-space:nowrap;text-shadow:0 1px 3px rgba(0,0,0,0.8);">' + t.name + '</div></div>',
+              iconSize: [56, 72],
+              iconAnchor: [28, 36],
             });
             var marker = L.marker([t.lat, t.lng], { icon: icon, interactive: false }).addTo(map);
             teammateMarkers[t.id] = marker;
@@ -465,7 +639,7 @@ const LEAFLET_HTML = `<!DOCTYPE html>
       };
 
       /**
-       * 更新队友位置和心率（每秒调用）
+       * 更新队友位置、心率、状态（每秒调用）
        */
       window.updateTeammates = function(teammatesJson) {
         try {
@@ -473,14 +647,21 @@ const LEAFLET_HTML = `<!DOCTYPE html>
           for (var i = 0; i < teammates.length; i++) {
             var t = teammates[i];
             var marker = teammateMarkers[t.id];
-            if (marker) {
-              marker.setLatLng([t.lat, t.lng]);
-              // 更新心率数字
-              var el = marker.getElement();
-              if (el) {
-                var hrEl = el.querySelector('.tm-hr-val');
-                if (hrEl) hrEl.textContent = t.heartRate;
-              }
+            if (!marker) continue;
+            marker.setLatLng([t.lat, t.lng]);
+            var el = marker.getElement();
+            if (!el) continue;
+            // 更新心率数字 + 颜色
+            var hrEl = el.querySelector('.tm-hr-val');
+            if (hrEl) {
+              var hColor = hrColor(t.heartRate);
+              hrEl.textContent = t.heartRate;
+              hrEl.style.color = hColor;
+            }
+            // 更新状态图标
+            var statusEl = el.querySelector('.tm-status');
+            if (statusEl) {
+              statusEl.textContent = t.isResting ? '🌙' : '🏃';
             }
           }
         } catch (e) {}
@@ -545,6 +726,8 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
   //   4. 当 duration/speed/weather 等 HUD 数据高频跳动时，MapContainer 零重绘
 
   const hikeStatus = useHikeStore((s) => s.hikeStatus);
+  const isRouteActive = useHikeStore((s) => s.isRouteActive);
+  const currentPath = useHikeStore(useShallow((s) => s.currentPath));
   const exploredGrids = useHikeStore(useShallow((s) => s.exploredGrids));
   const appendTrailPoints = useHikeStore((s) => s.appendTrailPoints);
   const setTotalDistance = useHikeStore((s) => s.setTotalDistance);
@@ -643,7 +826,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     }
   }, []);
 
-  // ---- Sync trail to WebView ----
+  // ---- Sync trail to WebView (from polling loop) ----
   useEffect(() => {
     if (!mapReady || displayPoints.length === 0) return;
 
@@ -654,6 +837,22 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     // drawTrack 内部处理单点 vs 多点逻辑
     injectCall(webViewRef, 'window.drawTrack', JSON.stringify(coords));
   }, [displayPoints, mapReady]);
+
+  // ---- Sync imported route to WebView (from importRoutePath) ----
+  // 当 currentPath 被外部导入时（isRouteActive），直接调用 drawTrack 渲染路线
+  const prevCurrentPathLenRef = useRef(0);
+  useEffect(() => {
+    if (!mapReady || !isRouteActive || currentPath.length === 0) return;
+    // 仅当 currentPath 长度变化时触发（避免 GPS 追加点重复渲染）
+    if (currentPath.length === prevCurrentPathLenRef.current) return;
+    prevCurrentPathLenRef.current = currentPath.length;
+
+    const coords: Array<[number, number]> = currentPath.map((p) => [
+      p.latitude,
+      p.longitude,
+    ]);
+    injectCall(webViewRef, 'window.drawTrack', JSON.stringify(coords));
+  }, [currentPath, mapReady, isRouteActive]);
 
   // ---- Sync explored grids to fog-of-war overlay ----
   const prevGridCountRef = useRef(0);
@@ -774,15 +973,16 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           } catch {}
         }
 
-        // 1d. 全部失败 → 使用西安默认坐标（国内地图可见）
+        // 1d. 全部失败 → 不设默认坐标，地图留在初始视角，无蓝点
         if (!coords) {
-          coords = { latitude: 34.2635, longitude: 108.948 };
-          console.log('[Map] 所有定位方式失败，使用西安默认坐标');
+          console.log('[Map] GPS 不可用，地图保持初始视角，等待导入路线或真实 GPS');
         }
 
         if (cancelled) return;
 
-        setUserLocation(coords);
+        if (coords) {
+          setUserLocation(coords);
+        }
         dismissLoadingOverlay();
 
         // ---- 第二步：启动持续前台定位追踪 ----
@@ -826,16 +1026,18 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     };
   }, [dismissLoadingOverlay]);
 
-  // ---- Send user location to map when known (setView, not fitBounds) ----
+  // ---- Send user location to map when known ----
+  // 有路线时只更新蓝点（recenter=false），无路线时 GPS 驱动地图中心（recenter=true）
   useEffect(() => {
     if (!mapReady || !userLocation) return;
-    injectCall(webViewRef, 'window.setUserLocation', userLocation.latitude, userLocation.longitude);
+    const shouldRecenter = !isRouteActive;
+    injectCall(webViewRef, 'window.setUserLocation', userLocation.latitude, userLocation.longitude, shouldRecenter);
     // 延迟刷新视口，确保 setView 后瓦片正确加载
     const timer = setTimeout(() => {
       injectCall(webViewRef, 'window.refreshView');
     }, 600);
     return () => clearTimeout(timer);
-  }, [userLocation, mapReady]);
+  }, [userLocation, mapReady, isRouteActive]);
 
   // ---- Foreground polling ----
   useEffect(() => {
@@ -848,6 +1050,7 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
     }
 
     pollTimerRef.current = setInterval(() => {
+      // ---- GPS 数据处理（有后台定位数据时） ----
       const bufferedPoints = getTrailBuffer();
       if (bufferedPoints.length > 0) {
         const simplified = processTrail(bufferedPoints, RDP_EPSILON);
@@ -871,21 +1074,22 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           trailPathLengthRef.current += newPoints.length;
           exploreGridsBatch(newPoints);
         }
+      }
 
-        // ---- 队友动画：首次初始化 + 每秒位移更新 ----
-        const currentPath = useHikeStore.getState().currentPath;
-        if (currentPath.length >= 4 && !teammatesInitedRef.current) {
-          animatorRef.current.init(currentPath);
-          teammatesInitedRef.current = true;
-          const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
-          if (renderData.length > 0) {
-            injectCall(webViewRef, 'window.addTeammates', JSON.stringify(renderData));
-          }
-        } else if (teammatesInitedRef.current) {
-          const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
-          if (renderData.length > 0) {
-            injectCall(webViewRef, 'window.updateTeammates', JSON.stringify(renderData));
-          }
+      // ---- 队友动画：首次初始化 + 每秒位移更新 ----
+      // 独立于 GPS 数据，导入路线时也能初始化队友
+      const currentPath = useHikeStore.getState().currentPath;
+      if (currentPath.length >= 4 && !teammatesInitedRef.current) {
+        animatorRef.current.init(currentPath);
+        teammatesInitedRef.current = true;
+        const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
+        if (renderData.length > 0) {
+          injectCall(webViewRef, 'window.addTeammates', JSON.stringify(renderData));
+        }
+      } else if (teammatesInitedRef.current) {
+        const renderData = animatorRef.current.tick(POLL_INTERVAL_MS / 1000);
+        if (renderData.length > 0) {
+          injectCall(webViewRef, 'window.updateTeammates', JSON.stringify(renderData));
         }
       }
     }, POLL_INTERVAL_MS);
@@ -897,6 +1101,49 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
       }
     };
   }, [isRecording, appendTrailPoints, setTotalDistance, setElevationGain, exploreGridsBatch]);
+
+  // ---- Route Info Card (shown when route is active) ----
+  const [routeInfo, setRouteInfo] = useState<{
+    distance: number;
+    elevationGain: number;
+    estimatedTime: number; // minutes
+    pointCount: number;
+  } | null>(null);
+  const [routeInfoVisible, setRouteInfoVisible] = useState(false);
+
+  useEffect(() => {
+    if (!isRouteActive || currentPath.length < 2) {
+      setRouteInfoVisible(false);
+      return;
+    }
+    // 计算路线统计
+    let dist = 0;
+    let gain = 0;
+    for (let i = 1; i < currentPath.length; i++) {
+      const prev = currentPath[i - 1];
+      const curr = currentPath[i];
+      // Haversine 距离
+      const R = 6371000;
+      const toRad = (d: number) => (d * Math.PI) / 180;
+      const dLat = toRad(curr.latitude - prev.latitude);
+      const dLon = toRad(curr.longitude - prev.longitude);
+      const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(prev.latitude)) * Math.cos(toRad(curr.latitude)) * Math.sin(dLon / 2) ** 2;
+      dist += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      // 海拔增益
+      if (prev.altitude != null && curr.altitude != null) {
+        const delta = curr.altitude - prev.altitude;
+        if (delta > 0) gain += delta;
+      }
+    }
+    // Naismith 估算时间：5km/h + 30min/300m 爬升
+    const hours = dist / 5000 + gain / 300 * 0.5;
+    setRouteInfo({ distance: dist, elevationGain: gain, estimatedTime: Math.round(hours * 60), pointCount: currentPath.length });
+    setRouteInfoVisible(true);
+    // 6 秒后自动隐藏
+    const timer = setTimeout(() => setRouteInfoVisible(false), 6000);
+    return () => clearTimeout(timer);
+  }, [isRouteActive, currentPath]);
 
   // ---- Cleanup ----
   useEffect(() => {
@@ -946,6 +1193,44 @@ function MapContainer({ tileSource = 'standard' }: MapContainerProps) {
           </BlurView>
         </Animated.View>
       )}
+
+      {/* Route Info Card */}
+      {routeInfoVisible && routeInfo && (
+        <Pressable
+          style={styles.routeInfoCard}
+          onPress={() => setRouteInfoVisible(false)}
+        >
+          <View style={styles.routeInfoRow}>
+            <View style={styles.routeInfoItem}>
+              <Text style={styles.routeInfoValue}>
+                {routeInfo.distance >= 1000
+                  ? (routeInfo.distance / 1000).toFixed(1) + ' km'
+                  : Math.round(routeInfo.distance) + ' m'}
+              </Text>
+              <Text style={styles.routeInfoLabel}>距离</Text>
+            </View>
+            <View style={styles.routeInfoDivider} />
+            <View style={styles.routeInfoItem}>
+              <Text style={styles.routeInfoValue}>{Math.round(routeInfo.elevationGain)} m</Text>
+              <Text style={styles.routeInfoLabel}>爬升</Text>
+            </View>
+            <View style={styles.routeInfoDivider} />
+            <View style={styles.routeInfoItem}>
+              <Text style={styles.routeInfoValue}>
+                {routeInfo.estimatedTime >= 60
+                  ? Math.floor(routeInfo.estimatedTime / 60) + 'h' + (routeInfo.estimatedTime % 60) + 'min'
+                  : routeInfo.estimatedTime + ' min'}
+              </Text>
+              <Text style={styles.routeInfoLabel}>预计</Text>
+            </View>
+            <View style={styles.routeInfoDivider} />
+            <View style={styles.routeInfoItem}>
+              <Text style={styles.routeInfoValue}>{routeInfo.pointCount}</Text>
+              <Text style={styles.routeInfoLabel}>轨迹点</Text>
+            </View>
+          </View>
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -992,6 +1277,49 @@ const styles = StyleSheet.create({
     marginTop: 10,
     fontSize: 9,
     color: 'rgba(255,255,255,0.2)',
+  },
+  // ---- Route Info Card ----
+  routeInfoCard: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    right: 12,
+    backgroundColor: 'rgba(18,19,20,0.85)',
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 8,
+    zIndex: 30,
+  },
+  routeInfoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+  },
+  routeInfoItem: {
+    alignItems: 'center',
+    flex: 1,
+  },
+  routeInfoValue: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  routeInfoLabel: {
+    fontSize: 10,
+    color: 'rgba(255,255,255,0.45)',
+    marginTop: 2,
+  },
+  routeInfoDivider: {
+    width: 1,
+    height: 28,
+    backgroundColor: 'rgba(255,255,255,0.1)',
   },
 });
 

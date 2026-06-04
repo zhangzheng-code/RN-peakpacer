@@ -59,6 +59,12 @@
           "isIosBackgroundLocationEnabled": true
         }
       ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "SmartHike 需要访问相机以进行人脸识别登录。"
+        }
+      ],
       "expo-task-manager",
       "react-native-health",
       "react-native-health-connect",

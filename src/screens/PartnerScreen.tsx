@@ -31,6 +31,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import { useHikeStore } from '../store/useHikeStore';
+import { useLoginGate } from '../hooks/useLoginGate';
 import {
   scoreMatch,
   calcPressure,
@@ -194,6 +195,7 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
   const profile = useHikeStore((s) => s.profile);
   const historyTracks = useHikeStore((s) => s.historyTracks);
   const navigation = useNavigation();
+  const { requireLogin } = useLoginGate();
 
   const scale = useSharedValue(1);
   const joinOpacity = useSharedValue(1);
@@ -251,6 +253,7 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
   const [isJoining, setIsJoining] = React.useState(false);
 
   const handleJoin = useCallback(() => {
+    if (!requireLogin('加入队伍')) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setIsJoining(true);
     // 按钮 loading 动画
@@ -265,7 +268,7 @@ function PartnerCard({ activity }: { activity: PartnerActivity }) {
         joinOpacity.value = withTiming(1, { duration: 200 });
       }, 500);
     }, 600);
-  }, [activity.path, importRoutePath, navigation, joinOpacity]);
+  }, [activity.path, importRoutePath, navigation, joinOpacity, requireLogin]);
 
   const isFull = activity.currentCount >= activity.maxCount;
   const statusColor =
@@ -482,6 +485,7 @@ export default function PartnerScreen() {
   const hideMatch = useHikeStore((s) => s.hideMatch);
 
   const importRoutePath = useHikeStore((s) => s.importRoutePath);
+  const { requireLogin } = useLoginGate();
 
   // 计算匹配结果
   const matchResults: MatchResult[] = useMemo(() => {
@@ -501,17 +505,19 @@ export default function PartnerScreen() {
   }, [profile, historyTracks]);
 
   const handleOpenMatch = useCallback(() => {
+    if (!requireLogin('智能匹配')) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     showMatch();
-  }, [showMatch]);
+  }, [showMatch, requireLogin]);
 
   const handleMatchCardPress = useCallback((result: MatchResult) => {
+    if (!requireLogin('加入匹配')) return;
     hideMatch();
     importRoutePath(result.path);
     setTimeout(() => {
       navigation.navigate('HikeGo' as never);
     }, 200);
-  }, [hideMatch, importRoutePath, navigation]);
+  }, [hideMatch, importRoutePath, navigation, requireLogin]);
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>

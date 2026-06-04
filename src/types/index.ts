@@ -1,7 +1,7 @@
 /**
  * 地图图源类型枚举
  */
-export type TileSourceType = 'standard' | 'satellite';
+export type TileSourceType = 'standard' | 'satellite' | 'topo';
 
 /**
  * 瓦片图源配置接口
