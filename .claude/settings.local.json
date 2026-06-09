@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(mv /tmp/smarthike-backup/.claude /tmp/smarthike-backup/AGENTS.md /tmp/smarthike-backup/CLAUDE.md /tmp/smarthike-backup/PROGRESS.md /tmp/smarthike-backup/.gitignore .)",
-      "Bash(mv \"/tmp/smarthike-backup/Step-by-Step 全流程闭环开发指令.txt\" .)"
+      "Bash(mv \"/tmp/smarthike-backup/Step-by-Step 全流程闭环开发指令.txt\" .)",
+      "Bash(ls \"D:\\\\SmartHike（综合）\\\\SmartHike\"/*.md)",
+      "Bash(ls \"D:\\\\SmartHike（综合）\\\\SmartHike\"/docs/*.md)"
     ]
   }
 }

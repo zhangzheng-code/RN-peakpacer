@@ -51,7 +51,14 @@ import {
   setMimoApiKey,
   getMimoApiKey,
   type MimoMessage,
+  type MimoToolCall,
 } from "../services/mimoService";
+import { buildToolsArray, getToolByName } from "../services/toolRegistry";
+import {
+  ToolCallWell,
+  type ToolCallState,
+  type ToolCallStatus,
+} from "../components/ToolCallWell";
 
 // ============================================================
 // 常量
@@ -331,6 +338,7 @@ interface ChatBubble {
   role: "user" | "assistant";
   content: string;
   isStreaming: boolean;
+  toolCalls?: ToolCallState[];
 }
 
 // ============================================================
@@ -677,6 +685,14 @@ function ChatBubbleView({ item }: { item: ChatBubble }) {
           <Text style={bubbleStyles.textUser}>{item.content}</Text>
         ) : (
           <View>
+            {/* Tool Call 卡片（在文本上方） */}
+            {item.toolCalls && item.toolCalls.length > 0 && (
+              <View style={{ marginBottom: 8 }}>
+                {item.toolCalls.map((tc) => (
+                  <ToolCallWell key={tc.id} tool={tc} />
+                ))}
+              </View>
+            )}
             {item.content.length > 0 ? (
               renderMarkdown(item.content)
             ) : item.isStreaming ? (
@@ -983,7 +999,7 @@ export default function AIGuideScreen() {
   // ---- 初始化 API Key ----
   useEffect(() => {
     if (!getMimoApiKey()) {
-      setMimoApiKey("sk-cokvf06cekn7l8na5a7zxi2af5uwfkxnb286amnc6qyc3aau");
+      setMimoApiKey("sk-cgkqgjz1qpkcmbs56wy0uyp22cwgsu7fngb1npxyljrsrwr7");
     }
   }, []);
 
@@ -1084,6 +1100,8 @@ export default function AIGuideScreen() {
       abortController.current = controller;
 
       try {
+        const tools = buildToolsArray();
+
         await sendMimoStream(
           mimoMessages,
           (_chunk, fullText, isDone) => {
@@ -1098,8 +1116,60 @@ export default function AIGuideScreen() {
             scrollToBottom();
           },
           controller.signal,
+          tools,
+          // onToolCall: 通知 UI 显示工具调用卡片
+          (toolCalls: MimoToolCall[]) => {
+            const toolStates: ToolCallState[] = toolCalls.map((tc) => {
+              const tool = getToolByName(tc.function.name);
+              return {
+                id: tc.id,
+                name: tc.function.name,
+                arguments: (() => {
+                  try { return JSON.parse(tc.function.arguments); }
+                  catch { return {}; }
+                })(),
+                status: "executing" as ToolCallStatus,
+                gradientColors: tool?.gradientColors ?? ("#6B7280" as any, "#4B5563" as any),
+                label: tool?.label ?? tc.function.name,
+                icon: tool?.icon ?? "🔧",
+              };
+            });
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiId ? { ...m, toolCalls: toolStates } : m,
+              ),
+            );
+          },
+          // onToolResult: 更新工具卡片状态
+          (toolCallId: string, result: object, error?: string) => {
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id !== aiId || !m.toolCalls) return m;
+                return {
+                  ...m,
+                  toolCalls: m.toolCalls.map((tc) =>
+                    tc.id === toolCallId
+                      ? {
+                          ...tc,
+                          status: (error ? "error" : "done") as ToolCallStatus,
+                          result: error ? undefined : result,
+                          error: error,
+                        }
+                      : tc,
+                  ),
+                };
+              }),
+            );
+          },
         );
       } catch (err: any) {
+        console.log("ERROR RAW =", err);
+        console.log("ERROR STRING =", String(err));
+        if (err instanceof Error) {
+          console.log("ERROR NAME =", err.name);
+          console.log("ERROR MESSAGE =", err.message);
+          console.log("ERROR STACK =", err.stack);
+        }
         if (controller.signal.aborted) return;
         setMessages((prev) =>
           prev.map((m) =>

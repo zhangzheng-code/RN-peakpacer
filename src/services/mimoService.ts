@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * 小米 MiMo API 流式对话服务
+ * 小米 MiMo API 对话服务（MCP Tool Calling 版）
  * ============================================================
  *
  * 自动检测 API Key 前缀，路由到对应端点：
@@ -8,10 +8,12 @@
  *   sk- → https://api.xiaomimimo.com/v1/chat/completions
  *
  * 旗舰模型锁定：mimo-v2.5-pro
- * 完全兼容 OpenAI /chat/completions 协议（stream: true）
+ * 完全兼容 OpenAI /chat/completions 协议
  *
- * 降级策略：当 RN Hermes 引擎不支持 response.body 时，
- * 自动降级为非流式请求 + 模拟逐字输出，保证 UX 一致。
+ * 支持：
+ *   - 纯文本对话（stream: false）
+ *   - MCP Tool Calling 循环（最多 3 轮）
+ *   - 打字机效果逐字输出
  */
 
 // ============================================================
@@ -34,33 +36,23 @@ const DEFAULT_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
 const DEFAULT_TEMPERATURE = 0.7;
 const DEFAULT_MAX_TOKENS = 8192;
 
+/** Tool Calling 最大轮次（防止无限循环） */
+const MAX_TOOL_ROUNDS = 3;
+
 // ============================================================
 // API Key 管理
 // ============================================================
 
 let apiKey: string = '';
 
-/**
- * 设置 MiMo API Key
- *
- * 传入后自动 trim，后续请求根据前缀自动路由到对应端点。
- */
 export function setMimoApiKey(key: string): void {
   apiKey = key.trim();
 }
 
-/** 获取当前 API Key（调试用） */
 export function getMimoApiKey(): string {
   return apiKey;
 }
 
-/**
- * 根据 API Key 前缀解析 endpoint
- *
- * - tp- 开头 → token-plan 国内端点
- * - sk- 开头 → 标准端点
- * - 其他     → 兜底标准端点
- */
 export function getMimoEndpoint(): string {
   if (!apiKey) return DEFAULT_ENDPOINT;
   for (const prefix of Object.keys(ENDPOINTS)) {
@@ -75,245 +67,132 @@ export function getMimoEndpoint(): string {
 // 类型定义
 // ============================================================
 
-/** 对话消息格式（兼容 OpenAI 协议） */
-export interface MimoMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
+/** 工具调用（OpenAI 兼容格式） */
+export interface MimoToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string; // JSON string
+  };
 }
 
-/**
- * 流式回调函数类型
- *
- * @param chunk    - 本次收到的增量文本片段
- * @param fullText - 截至目前累积的完整文本
- * @param isDone   - 是否已接收完毕
- */
+/** 对话消息格式（兼容 OpenAI 协议 + Tool Calling） */
+export interface MimoMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: MimoToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+/** 流式回调函数类型 */
 export type MimoStreamCallback = (
   chunk: string,
   fullText: string,
   isDone: boolean,
 ) => void;
 
+/** Tool Call 通知回调 */
+export type ToolCallCallback = (toolCalls: MimoToolCall[]) => void;
+
+/** Tool Result 通知回调（UI 可用于更新卡片状态） */
+export type ToolResultCallback = (toolCallId: string, result: object, error?: string) => void;
+
 // ============================================================
-// 网络重试配置
+// 内部核心 — 纯 JSON 请求（返回完整 choice 对象）
 // ============================================================
 
-/** 最大重试次数 */
-const MAX_RETRIES = 3;
+interface MimoResponseMessage {
+  role: string;
+  content: string | null;
+  tool_calls?: MimoToolCall[];
+}
 
-/** 基础重试延迟（ms），指数退避：1s → 2s → 4s */
-const RETRY_BASE_DELAY_MS = 1000;
-
-/** 单次请求超时（ms） */
-const REQUEST_TIMEOUT_MS = 60000;
-
-/**
- * 判断错误是否为可重试的网络异常
- * 仅对连接断开、超时、DNS 失败等网络层错误重试，
- * 不对 4xx API 错误重试。
- */
-function isRetryableError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const msg = error.message.toLowerCase();
-  return (
-    msg.includes('socket') ||
-    msg.includes('network') ||
-    msg.includes('aborted') ||
-    msg.includes('timeout') ||
-    msg.includes('econnreset') ||
-    msg.includes('econnrefused') ||
-    msg.includes('fetch failed') ||
-    msg.includes('unexpected end') ||
-    msg.includes('closed unexpectedly')
-  );
+interface MimoChoice {
+  message: MimoResponseMessage;
+  finish_reason: string;
 }
 
 /**
- * 带指数退避的 fetch 重试包装器
- *
- * 兼容 Hermes 引擎：不使用 AbortSignal.any（Hermes 不支持），
- * 改用轮询检测外部 signal + 内部超时的双层控制。
- *
- * @param url     - 请求地址
- * @param options - fetch 选项（不含 signal，由内部管理超时）
- * @param signal  - 外部 AbortSignal（用于 UI 取消）
- * @returns Response 对象
+ * 发送一次非流式请求，返回完整的 choice 对象
+ * （而非仅 content，以便检查 tool_calls）
  */
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
-  signal?: AbortSignal,
-): Promise<Response> {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    // 如果外部已取消，直接中止
-    if (signal?.aborted) {
-      throw new DOMException('The operation was aborted.', 'AbortError');
-    }
-
-    // 为每次请求创建独立的超时控制器
-    const timeoutController = new AbortController();
-
-    // 监听外部取消信号 → 转发到超时控制器
-    let onAbort: (() => void) | null = null;
-    if (signal) {
-      onAbort = () => timeoutController.abort();
-      signal.addEventListener('abort', onAbort);
-    }
-
-    const timeoutTimer = setTimeout(() => timeoutController.abort(), REQUEST_TIMEOUT_MS);
-
-    try {
-      const response = await fetch(url, {
-        ...options,
-        signal: timeoutController.signal,
-      });
-      clearTimeout(timeoutTimer);
-      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-      return response;
-    } catch (error) {
-      clearTimeout(timeoutTimer);
-      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-      lastError = error;
-
-      // 外部取消不重试
-      if (signal?.aborted) throw error;
-
-      // 可重试且还有剩余次数
-      if (isRetryableError(error) && attempt < MAX_RETRIES) {
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-        console.warn(
-          `[MiMo] 网络异常，${delay}ms 后第 ${attempt + 2}/${MAX_RETRIES + 1} 次重试:`,
-          (error as Error).message,
-        );
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
-      }
-
-      // 不可重试或已耗尽重试次数
-      throw error;
-    }
-  }
-
-  throw lastError;
-}
-
-// ============================================================
-// 内部工具函数
-// ============================================================
-
-/**
- * SSE 数据行解析器
- *
- * 从 data 帧中提取 choices[0].delta.content。
- * 健壮性：过滤空行、注释行、非 JSON、API 错误。
- *
- * @param line - 单行 SSE 数据（已去除 "data: " 前缀）
- * @returns 提取的文本片段；[DONE] 或无效数据返回 null
- */
-function parseSSELine(line: string): string | null {
-  const trimmed = line.trim();
-
-  // 流结束标记
-  if (trimmed === '[DONE]') return null;
-
-  // 空行或 SSE 注释（以 ":" 开头）
-  if (!trimmed || !trimmed.startsWith('{')) return null;
-
-  try {
-    const parsed = JSON.parse(trimmed);
-
-    // API 错误响应
-    if (parsed.error) {
-      const errMsg = parsed.error.message || JSON.stringify(parsed.error);
-      throw new Error(`MiMo API 错误: ${errMsg}`);
-    }
-
-    // 提取 delta.content
-    if (parsed.choices && parsed.choices.length > 0) {
-      const delta = parsed.choices[0].delta;
-      if (delta && typeof delta.content === 'string') {
-        return delta.content;
-      }
-    }
-    return null;
-  } catch (e) {
-    // 重新抛出 API 错误，吞掉 JSON 解析失败
-    if (e instanceof Error && e.message.startsWith('MiMo API 错误')) throw e;
-    return null;
-  }
-}
-
-/**
- * 检测当前环境是否支持 ReadableStream 流式读取
- *
- * RN Hermes 引擎下 response.body 可能为 null，
- * 此时无法使用流式读取，需要降级处理。
- */
-function isStreamSupported(response: Response): boolean {
-  return response.body !== null && typeof response.body?.getReader === 'function';
-}
-
-/**
- * 发送非流式聊天请求（内部方法，用于降级）
- */
-async function sendNonStreaming(messages: MimoMessage[]): Promise<string> {
+async function sendOnce(
+  messages: MimoMessage[],
+  tools?: object[],
+): Promise<MimoChoice> {
   const endpoint = getMimoEndpoint();
-  const response = await fetchWithRetry(endpoint, {
+
+  const body: Record<string, any> = {
+    model: MODEL_ID,
+    messages,
+    stream: false,
+    temperature: DEFAULT_TEMPERATURE,
+    max_tokens: DEFAULT_MAX_TOKENS,
+  };
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
+
+  const bodyStr = JSON.stringify(body);
+
+  console.log('[MiMo] ===== 请求开始 =====');
+  console.log('[MiMo] endpoint =', endpoint);
+  console.log('[MiMo] Authorization = Bearer ' + apiKey.slice(0, 6) + '***' + apiKey.slice(-4));
+  console.log('[MiMo] body length =', bodyStr.length);
+  if (tools) console.log('[MiMo] tools count =', tools.length);
+
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      messages,
-      stream: false,
-      temperature: DEFAULT_TEMPERATURE,
-      max_tokens: DEFAULT_MAX_TOKENS,
-    }),
+    body: bodyStr,
   });
+
+  console.log('[MiMo] HTTP Status =', response.status);
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`MiMo API 请求失败 (${response.status}): ${errText}`);
+    console.log('[MiMo] Error Body =', errText.slice(0, 500));
+    const statusMsg: Record<number, string> = {
+      401: 'API Key 无效或已过期',
+      403: 'API Key 无权访问该模型',
+      429: '请求过于频繁，请稍后再试',
+      500: 'MiMo 服务器内部错误',
+      502: 'MiMo 服务网关异常',
+      503: 'MiMo 服务暂时不可用',
+    };
+    const hint = statusMsg[response.status] || `HTTP ${response.status}`;
+    throw new Error(`${hint}：${errText.slice(0, 200)}`);
   }
 
-  const data = await response.json();
+  const rawText = await response.text();
+  console.log('[MiMo] Response length =', rawText.length);
+
+  if (!rawText || rawText.trim().length === 0) {
+    throw new Error('MiMo API 返回空响应体');
+  }
+
+  let data: any;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    console.log('[MiMo] JSON parse failed, raw =', rawText.slice(0, 500));
+    throw new Error('MiMo API 返回了非 JSON 响应');
+  }
 
   if (data.error) {
     throw new Error(`MiMo API 错误: ${data.error.message || JSON.stringify(data.error)}`);
   }
 
-  if (data.choices && data.choices.length > 0) {
-    return data.choices[0].message.content;
+  if (!data.choices || data.choices.length === 0) {
+    throw new Error('MiMo API 返回空响应');
   }
 
-  throw new Error('MiMo API 返回空响应');
-}
-
-/**
- * 模拟流式逐字输出（用于降级场景）
- *
- * 当环境不支持 ReadableStream 时，先获取完整响应，
- * 再通过定时器模拟逐字输出效果，保持用户体验一致。
- */
-async function simulateStreaming(fullText: string, onChunk: MimoStreamCallback): Promise<void> {
-  const CHAR_DELAY_MS = 20;
-  let accumulated = '';
-
-  for (let i = 0; i < fullText.length; i++) {
-    accumulated += fullText[i];
-    onChunk(fullText[i], accumulated, false);
-
-    // 每隔一定字符让出事件循环，允许 UI 更新
-    if (i % 3 === 0) {
-      await new Promise((r) => setTimeout(r, CHAR_DELAY_MS));
-    }
-  }
-
-  onChunk('', fullText, true);
+  return data.choices[0] as MimoChoice;
 }
 
 // ============================================================
@@ -321,134 +200,132 @@ async function simulateStreaming(fullText: string, onChunk: MimoStreamCallback):
 // ============================================================
 
 /**
- * 发送流式聊天请求到 MiMo API
+ * 发送聊天请求到 MiMo API（支持 MCP Tool Calling）
  *
  * 核心流程：
  *   1. 校验 API Key
- *   2. 根据 Key 前缀选择 endpoint
- *   3. fetch POST（stream: true）
- *   4. 检测 response.body 是否可用
- *      - 可用 → ReadableStream 流式读取 SSE
- *      - 不可用 → 降级为非流式 + 模拟逐字输出
+ *   2. fetch POST → 检查 response
+ *   3. 如果有 tool_calls → 执行工具 → 把结果注入 messages → 再次请求
+ *   4. 循环最多 MAX_TOOL_ROUNDS 轮
+ *   5. 最终文本回复 → 打字机效果输出
  *
- * @param messages - 完整的对话消息数组（含 system prompt）
- * @param onChunk  - 流式回调函数
- * @param signal   - AbortSignal，用于取消请求
+ * @param messages    - 完整的对话消息数组（含 system prompt）
+ * @param onChunk     - 打字机回调
+ * @param signal      - AbortSignal
+ * @param tools       - OpenAI tools 数组（可选）
+ * @param onToolCall  - 工具调用通知回调（可选）
+ * @param onToolResult - 工具结果通知回调（可选）
  */
 export async function sendMimoStream(
   messages: MimoMessage[],
   onChunk: MimoStreamCallback,
   signal?: AbortSignal,
+  tools?: object[],
+  onToolCall?: ToolCallCallback,
+  onToolResult?: ToolResultCallback,
 ): Promise<void> {
   if (!apiKey) {
     throw new Error('MiMo API Key 未设置，请先调用 setMimoApiKey()');
   }
 
-  const endpoint = getMimoEndpoint();
-
-  const response = await fetchWithRetry(
-    endpoint,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        messages,
-        stream: true,
-        temperature: DEFAULT_TEMPERATURE,
-        max_tokens: DEFAULT_MAX_TOKENS,
-      }),
-    },
-    signal,
-  );
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`MiMo API 请求失败 (${response.status}): ${errText}`);
+  if (signal?.aborted) {
+    throw new Error('请求已取消');
   }
 
-  // ---- 检测流式支持 ----
+  // 对话历史（tool call 循环中会追加消息）
+  const conversation = [...messages];
 
-  if (!isStreamSupported(response)) {
-    // 降级：重新发起非流式请求 + 模拟逐字输出
-    const fullText = await sendNonStreaming(messages);
-    await simulateStreaming(fullText, onChunk);
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    if (signal?.aborted) throw new Error('请求已取消');
+
+    const choice = await sendOnce(conversation, tools);
+    const msg = choice.message;
+
+    // ---- 情况 A：模型返回了 tool_calls ----
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      console.log(`[MiMo] Tool Call 第 ${round + 1} 轮，${msg.tool_calls.length} 个工具`);
+
+      // 通知 UI 有工具调用
+      onToolCall?.(msg.tool_calls);
+
+      // 把 assistant 消息（含 tool_calls）加入对话历史
+      conversation.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: msg.tool_calls,
+      });
+
+      // 逐个执行工具
+      for (const tc of msg.tool_calls) {
+        if (signal?.aborted) throw new Error('请求已取消');
+
+        const { getToolByName } = await import('./toolRegistry');
+        const tool = getToolByName(tc.function.name);
+
+        let result: object;
+        let error: string | undefined;
+
+        try {
+          const args = JSON.parse(tc.function.arguments);
+          if (tool) {
+            const { useHikeStore } = await import('../store/useHikeStore');
+            const store = useHikeStore.getState();
+            result = await tool.execute(args, store);
+          } else {
+            result = { error: `未知工具: ${tc.function.name}` };
+          }
+        } catch (err) {
+          result = { error: String(err) };
+          error = String(err);
+        }
+
+        console.log('[MiMo] 工具执行:', tc.function.name, error ? '❌' : '✅');
+
+        // 通知 UI 工具结果
+        onToolResult?.(tc.id, result, error);
+
+        // 把工具结果加入对话历史
+        conversation.push({
+          role: 'tool',
+          content: JSON.stringify(result),
+          tool_call_id: tc.id,
+          name: tc.function.name,
+        });
+      }
+
+      // 继续下一轮（让 MiMo 基于工具结果生成回复）
+      continue;
+    }
+
+    // ---- 情况 B：正常文本回复 ----
+    const fullText = msg.content || '';
+
+    // 打字机效果
+    const CHAR_DELAY_MS = 18;
+    let accumulated = '';
+    for (let i = 0; i < fullText.length; i++) {
+      if (signal?.aborted) throw new Error('请求已取消');
+      accumulated += fullText[i];
+      onChunk(fullText[i], accumulated, false);
+      if (i % 2 === 0) {
+        await new Promise((r) => setTimeout(r, CHAR_DELAY_MS));
+      }
+    }
+    onChunk('', fullText, true);
     return;
   }
 
-  // ---- 流式读取 ----
-
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let fullText = '';
-  let lineBuffer = '';
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) {
-        // 流结束，处理缓冲区中可能残留的最后一行
-        if (lineBuffer.trim().length > 0 && lineBuffer.startsWith('data: ')) {
-          const content = parseSSELine(lineBuffer.slice(6));
-          if (content) {
-            fullText += content;
-            onChunk(content, fullText, false);
-          }
-        }
-        onChunk('', fullText, true);
-        break;
-      }
-
-      // 将 Uint8Array 解码为字符串，拼接到行缓冲区
-      const chunk = decoder.decode(value, { stream: true });
-      lineBuffer += chunk;
-
-      // 按行分割处理
-      const lines = lineBuffer.split('\n');
-
-      // 最后一个元素可能是不完整的行，保留在缓冲区
-      lineBuffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith(':')) continue;
-
-        if (trimmed.startsWith('data: ')) {
-          const payload = trimmed.slice(6);
-          const content = parseSSELine(payload);
-
-          if (content === null) {
-            // [DONE] 标记
-            if (payload.trim() === '[DONE]') {
-              onChunk('', fullText, true);
-              return;
-            }
-            continue;
-          }
-
-          fullText += content;
-          onChunk(content, fullText, false);
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
+  // 超过最大轮次
+  throw new Error('工具调用轮次超限');
 }
 
 /**
- * 发送非流式聊天请求（公开方法，备用方案）
- *
- * @param messages - 完整的对话消息数组（含 system prompt）
- * @returns AI 回复文本
+ * 发送非流式聊天请求（备用，不含 tool call 循环）
  */
 export async function sendMimoChat(messages: MimoMessage[]): Promise<string> {
   if (!apiKey) {
     throw new Error('MiMo API Key 未设置，请先调用 setMimoApiKey()');
   }
-  return sendNonStreaming(messages);
+  const choice = await sendOnce(messages);
+  return choice.message.content || '';
 }
